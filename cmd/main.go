@@ -155,6 +155,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	recorder := mgr.GetEventRecorderFor("k0smotron")
+
 	restConfig, err := loadRestConfig()
 	if err != nil {
 		setupLog.Error(err, "unable to get cluster config")
@@ -233,6 +235,7 @@ func main() {
 			Client:     mgr.GetClient(),
 			ClientSet:  clientSet,
 			RESTConfig: restConfig,
+			Recorder:   recorder,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "K0sController")
 			os.Exit(1)
