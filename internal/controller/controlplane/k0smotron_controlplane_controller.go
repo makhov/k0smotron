@@ -420,7 +420,8 @@ func (c *K0smotronController) computeStatus(ctx context.Context, cluster types.N
 	kcp.Status.UnavailableReplicas = int32(unavailableReplicas)
 
 	if kcp.Status.ReadyReplicas > 0 {
-		kcp.Status.Version = minimumVersion.String()
+		kcp.Status.Version = cleanK8sVersion(minimumVersion.String())
+		kcp.Status.K0sVersion = minimumVersion.String()
 	}
 
 	// if no replicas are yet available or the desired version is not in the current state of the
@@ -430,6 +431,15 @@ func (c *K0smotronController) computeStatus(ctx context.Context, cluster types.N
 	}
 
 	return nil
+}
+
+func cleanK8sVersion(k0sVersion string) string {
+	if strings.Contains(k0sVersion, "-") {
+		// Remove the suffix from the version string to match the format used in K0smotronControlPlane.spec.Version
+		return strings.Split(k0sVersion, "-")[0]
+	}
+
+	return k0sVersion
 }
 
 func (c *K0smotronController) getComparableK0sVersionRunningInPod(ctx context.Context, pod *corev1.Pod) (*version.Version, error) {

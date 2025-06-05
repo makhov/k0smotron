@@ -76,6 +76,8 @@ type K0smotronControlPlaneStatus struct {
 	// in the cluster.
 	// +optional
 	Version string `json:"version"`
+	// k0sVersion represents the version of k0s that is used by this control plane.
+	K0sVersion string `json:"k0sVersion"`
 	// replicas is the total number of pods targeted by this control plane
 	// +optional
 	Replicas int32 `json:"replicas"`

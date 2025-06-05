@@ -4596,6 +4596,10 @@ spec:
                   The value of this field is never updated after provisioning is completed. Please use conditions
                   to check the operational state of the control plane.
                 type: boolean
+              k0sVersion:
+                description: k0sVersion represents the version of k0s that is used
+                  by this control plane.
+                type: string
               ready:
                 description: Ready denotes that the control plane is ready
                 type: boolean
@@ -4627,6 +4631,8 @@ spec:
                   version represents the minimum Kubernetes version for the control plane pods
                   in the cluster.
                 type: string
+            required:
+            - k0sVersion
             type: object
         type: object
     served: true

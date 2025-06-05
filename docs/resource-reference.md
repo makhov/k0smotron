@@ -12443,6 +12443,13 @@ merge patch.<br/>
         </tr>
     </thead>
     <tbody><tr>
+        <td><b>k0sVersion</b></td>
+        <td>string</td>
+        <td>
+          k0sVersion represents the version of k0s that is used by this control plane.<br/>
+        </td>
+        <td>true</td>
+      </tr><tr>
         <td><b>externalManagedControlPlane</b></td>
         <td>boolean</td>
         <td>
