@@ -51,6 +51,10 @@ type RemoteMachineSpec struct {
 	// +kubebuilder:validation:Optional
 	ProviderID string `json:"providerID,omitempty"`
 
+	RemoteMachineResource `json:",inline"`
+}
+
+type RemoteMachineResource struct {
 	// Address is the IP address or DNS name of the remote machine.
 	// +kubebuilder:validation:Optional
 	Address string `json:"address,omitempty"`
@@ -126,32 +130,8 @@ type PooledRemoteMachine struct {
 }
 
 type PooledRemoteMachineSpec struct {
-	Pool    string            `json:"pool"`
-	Machine PooledMachineSpec `json:"machine"`
-}
-
-type PooledMachineSpec struct {
-	// Address is the IP address or DNS name of the remote machine.
-	// +kubebuilder:validation:Required
-	Address string `json:"address"`
-
-	// Port is the SSH port of the remote machine.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:default=22
-	Port int `json:"port"`
-
-	// User is the user to use when connecting to the remote machine.
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:default="root"
-	User string `json:"user"`
-
-	// +kubebuilder:validation:Optional
-	UseSudo bool `json:"useSudo,omitempty"`
-
-	// SSHKeyRef is a reference to a secret that contains the SSH private key.
-	// The key must be placed on the secret using the key "value".
-	// +kubebuilder:validation:Required
-	SSHKeyRef SecretRef `json:"sshKeyRef"`
+	Pool    string                `json:"pool"`
+	Machine RemoteMachineResource `json:"machine"`
 }
 
 type PooledRemoteMachineStatus struct {
