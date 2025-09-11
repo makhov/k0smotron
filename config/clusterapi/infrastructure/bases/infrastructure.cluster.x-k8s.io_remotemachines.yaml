@@ -8729,6 +8729,11 @@ spec:
                 description: User is the user to use when connecting to the remote
                   machine.
                 type: string
+              workingDir:
+                default: /var/run/k0smotron
+                description: WorkingDir is the directory to use as working directory
+                  when connecting to the remote machine.
+                type: string
             type: object
           status:
             description: RemoteMachineStatus defines the observed state of RemoteMachine

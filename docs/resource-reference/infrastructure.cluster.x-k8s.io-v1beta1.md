@@ -812,6 +812,15 @@ The key must be placed on the secret using the key "value".<br/>
             <i>Default</i>: root<br/>
         </td>
         <td>false</td>
+      </tr><tr>
+        <td><b>workingDir</b></td>
+        <td>string</td>
+        <td>
+          WorkingDir is the directory to use as working directory when connecting to the remote machine.<br/>
+          <br/>
+            <i>Default</i>: /var/run/k0smotron<br/>
+        </td>
+        <td>false</td>
       </tr></tbody>
 </table>
 

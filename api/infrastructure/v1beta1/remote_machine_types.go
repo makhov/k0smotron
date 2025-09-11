@@ -65,6 +65,11 @@ type RemoteMachineSpec struct {
 	// +kubebuilder:default="root"
 	User string `json:"user,omitempty"`
 
+	// WorkingDir is the directory to use as working directory when connecting to the remote machine.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default="/var/run/k0smotron"
+	WorkingDir string `json:"workingDir,omitempty"`
+
 	// +kubebuilder:validation:Optional
 	UseSudo bool `json:"useSudo,omitempty"`
 
