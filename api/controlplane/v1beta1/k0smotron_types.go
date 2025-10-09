@@ -19,7 +19,7 @@ package v1beta1
 import (
 	kmapi "github.com/k0sproject/k0smotron/api/k0smotron.io/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 const K0smotronControlPlaneFinalizer = "k0smotron.controlplane.cluster.x-k8s.io"
