@@ -809,6 +809,13 @@ If specified the version field is ignored and what ever version is downloaded fr
         </td>
         <td>false</td>
       </tr><tr>
+        <td><b>isWindows</b></td>
+        <td>boolean</td>
+        <td>
+          IsWindows specifies whether the target node is Windows.<br/>
+        </td>
+        <td>false</td>
+      </tr><tr>
         <td><b>k0sInstallDir</b></td>
         <td>string</td>
         <td>
@@ -1547,6 +1554,13 @@ If specified the version field is ignored and what ever version is downloaded fr
         <td>object</td>
         <td>
           Ignition defines the ignition configuration. If empty, k0smotron will use cloud-init.<br/>
+        </td>
+        <td>false</td>
+      </tr><tr>
+        <td><b>isWindows</b></td>
+        <td>boolean</td>
+        <td>
+          IsWindows specifies whether the target node is Windows.<br/>
         </td>
         <td>false</td>
       </tr><tr>
