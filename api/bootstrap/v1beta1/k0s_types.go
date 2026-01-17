@@ -52,6 +52,13 @@ const (
 	ConfigReadyUnknownReason = clusterv1.ReadyUnknownReason
 )
 
+const (
+	// PlatformLinux represents Linux platform
+	PlatformLinux = "linux"
+	// PlatformWindows represents Windows platform
+	PlatformWindows = "windows"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:labels="cluster.x-k8s.io/v1beta1=v1beta1"
@@ -148,9 +155,11 @@ type K0sWorkerConfigSpec struct {
 	// WorkingDir specifies the working directory where k0smotron will place its files.
 	WorkingDir string `json:"workingDir,omitempty"`
 
-	// IsWindows specifies whether the target node is Windows.
+	// Platform specifies the target platform for the worker node.
 	// +kubebuilder:validation:Optional
-	IsWindows bool `json:"isWindows,omitempty"`
+	// +kubebuilder:default="linux"
+	// +kubebuilder:validation:Enum=linux;windows
+	Platform string `json:"platform,omitempty"`
 }
 
 // SecretMetadata defines metadata to be propagated to the bootstrap Secret
@@ -536,7 +545,7 @@ func (cs *K0sWorkerConfigSpec) validateVersion(pathPrefix *field.Path) field.Err
 var minWindowsVersion = version.MustParse("v1.34.2+k0s.0")
 
 func (cs *K0sWorkerConfigSpec) validateWindows(pathPrefix *field.Path) field.ErrorList {
-	if !cs.IsWindows {
+	if cs.Platform != PlatformWindows {
 		return field.ErrorList{}
 	}
 
