@@ -554,7 +554,7 @@ func TestReconcileGenerateBootstrapData(t *testing.T) {
 	r := &Controller{
 		Client:                testEnv,
 		workloadClusterClient: workloadClient,
-		SecretCachingClient:   secretCachingClient,
+		SecretCachingClient:   testEnv,
 	}
 
 	clusterCerts := secret.NewCertificatesForInitialControlPlane(&kubeadmbootstrapv1.ClusterConfiguration{})

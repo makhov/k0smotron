@@ -335,6 +335,7 @@ func (c *ControlPlaneController) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Set the status to ready
 	config.Status.Ready = true
+	config.Status.Initialization.DataSecretCreated = true
 	config.Status.DataSecretName = ptr.To(bootstrapSecret.Name)
 
 	log.Info("Reconciled succesfully")

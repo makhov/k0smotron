@@ -2753,6 +2753,13 @@ If empty, k0smotron will use the default one.<br/>
         </td>
         <td>false</td>
       </tr><tr>
+        <td><b><a href="#k0scontrollerconfigstatusinitialization">initialization</a></b></td>
+        <td>object</td>
+        <td>
+          Initialization represents the initialization status of the worker node<br/>
+        </td>
+        <td>false</td>
+      </tr><tr>
         <td><b>ready</b></td>
         <td>boolean</td>
         <td>
@@ -2834,6 +2841,33 @@ with respect to the current state of the instance.<br/>
           <br/>
             <i>Format</i>: int64<br/>
             <i>Minimum</i>: 0<br/>
+        </td>
+        <td>false</td>
+      </tr></tbody>
+</table>
+
+
+### K0sControllerConfig.status.initialization
+<sup><sup>[↩ Parent](#k0scontrollerconfigstatus-1)</sup></sup>
+
+
+
+Initialization represents the initialization status of the worker node
+
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Description</th>
+            <th>Required</th>
+        </tr>
+    </thead>
+    <tbody><tr>
+        <td><b>dataSecretCreated</b></td>
+        <td>boolean</td>
+        <td>
+          <br/>
         </td>
         <td>false</td>
       </tr></tbody>
@@ -3422,6 +3456,13 @@ SecretMetadata specifies metadata (labels and annotations) to be propagated to t
         </td>
         <td>false</td>
       </tr><tr>
+        <td><b><a href="#k0sworkerconfigstatusinitialization">initialization</a></b></td>
+        <td>object</td>
+        <td>
+          Initialization represents the initialization status of the worker node<br/>
+        </td>
+        <td>false</td>
+      </tr><tr>
         <td><b>ready</b></td>
         <td>boolean</td>
         <td>
@@ -3503,6 +3544,33 @@ with respect to the current state of the instance.<br/>
           <br/>
             <i>Format</i>: int64<br/>
             <i>Minimum</i>: 0<br/>
+        </td>
+        <td>false</td>
+      </tr></tbody>
+</table>
+
+
+### K0sWorkerConfig.status.initialization
+<sup><sup>[↩ Parent](#k0sworkerconfigstatus-1)</sup></sup>
+
+
+
+Initialization represents the initialization status of the worker node
+
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Description</th>
+            <th>Required</th>
+        </tr>
+    </thead>
+    <tbody><tr>
+        <td><b>dataSecretCreated</b></td>
+        <td>boolean</td>
+        <td>
+          <br/>
         </td>
         <td>false</td>
       </tr></tbody>

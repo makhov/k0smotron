@@ -27,7 +27,7 @@ patches:
 - path: patches/certificate_patch.yaml
 
 configurations:
-#- kustomizeconfig.yaml
+- kustomizeconfig.yaml
 #
 #
 ## [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in

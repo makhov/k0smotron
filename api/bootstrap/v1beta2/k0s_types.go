@@ -184,9 +184,17 @@ type K0sWorkerConfigStatus struct {
 	// +optional
 	DataSecretName *string `json:"dataSecretName,omitempty"`
 
+	// Initialization represents the initialization status of the worker node
+	// +optional
+	Initialization StatusInitialization `json:"initialization,omitempty"`
+
 	// Conditions defines current service state of the K0sWorkerConfig.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type StatusInitialization struct {
+	DataSecretCreated bool `json:"dataSecretCreated,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -211,6 +219,10 @@ type K0sControllerConfigStatus struct {
 	// DataSecretName is the name of the secret that stores the bootstrap data script.
 	// +optional
 	DataSecretName *string `json:"dataSecretName,omitempty"`
+
+	// Initialization represents the initialization status of the worker node
+	// +optional
+	Initialization StatusInitialization `json:"initialization,omitempty"`
 
 	// Conditions defines current service state of the K0sControllerConfig.
 	// +optional
