@@ -5104,6 +5104,8 @@ spec:
     name: v1beta2
     schema:
       openAPIV3Schema:
+        description: K0smotronControlPlane is the Schema for the K0smotronControlPlanes
+          API
         properties:
           apiVersion:
             description: |-
@@ -9978,6 +9980,8 @@ spec:
               initialized: false
               ready: false
               version: ""
+            description: K0smotronControlPlaneStatus defines the observed state of
+              K0smotronControlPlane
             properties:
               conditions:
                 description: Conditions defines current service state of the K0smotronControlPlane.
