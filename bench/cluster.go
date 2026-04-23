@@ -72,12 +72,14 @@ type clusterMeta struct {
 }
 
 type clusterSpec struct {
-	Replicas        int32          `json:"replicas"`
-	Version         string         `json:"version"`
-	ExternalAddress string         `json:"externalAddress,omitempty"`
-	K0sConfig       map[string]any `json:"k0sConfig,omitempty"`
-	Service         km.ServiceSpec `json:"service"`
-	Storage         km.StorageSpec `json:"storage"`
+	Replicas        int32               `json:"replicas"`
+	Image           string              `json:"image,omitempty"`
+	Version         string              `json:"version"`
+	ExternalAddress string              `json:"externalAddress,omitempty"`
+	K0sConfig       map[string]any      `json:"k0sConfig,omitempty"`
+	Patches         []km.ComponentPatch `json:"patches,omitempty"`
+	Service         km.ServiceSpec      `json:"service"`
+	Storage         km.StorageSpec      `json:"storage"`
 }
 
 // createCluster POSTs a new k0smotron Cluster resource via the raw REST client.
@@ -99,9 +101,11 @@ func createCluster(ctx context.Context, kc *kubernetes.Clientset, name, ns strin
 		},
 		Spec: clusterSpec{
 			Replicas:        replicas,
+			Image:           cfg.Image,
 			Version:         cfg.K0sVersion,
 			ExternalAddress: cfg.ExternalAddress,
 			K0sConfig:       k0sConfigWithSANs(cfg.APISANs),
+			Patches:         cfg.Patches,
 			Service: km.ServiceSpec{
 				Type:             svcType,
 				APIPort:          hcpAPINodePort,

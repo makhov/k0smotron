@@ -45,6 +45,8 @@ type ScenarioConfig struct {
 	// APISANs are merged into k0sConfig.spec.api.sans for the child API server
 	// certificate. Perf NodePort tests include all worker external addresses.
 	APISANs []string
+	Image   string
+	Patches []km.ComponentPatch
 
 	HCPReplicas  int32
 	ClusterCount int

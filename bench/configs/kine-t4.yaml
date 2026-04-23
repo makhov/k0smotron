@@ -1,0 +1,13 @@
+# Kine storage backend using a T4 (etcd-compatible) endpoint via the kine driver.
+# T4 exposes an etcd v3 interface; kine connects via its etcd3 URL scheme.
+# Requires env var: BENCH_T4_URL
+# Example URL: etcd3://user:pass@t4-host:2379
+#
+# API: k0smotron.io/v1beta2 Cluster – spec.storage section
+spec:
+  storage:
+    type: kine
+    kine:
+      dataSourceURL: "${BENCH_T4_URL}"
+      # Alternatively reference a secret:
+      # dataSourceSecretName: bench-t4-dsn

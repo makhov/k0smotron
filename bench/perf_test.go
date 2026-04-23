@@ -26,7 +26,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -65,7 +64,7 @@ func TestStoragePerformanceHA(t *testing.T) {
 func runStoragePerformanceSuite(t *testing.T, reporter *PerfCSVReporter, replicas int32, nameSuffix string) {
 	filter := parseFilter(*storageFilter)
 
-	for _, sc := range storageConfigs(*k0sVersion) {
+	for _, sc := range perfStorageConfigs(*k0sVersion) {
 		sc := sc
 		if len(filter) > 0 && !filter[sc.StorageName] {
 			continue
@@ -110,18 +109,9 @@ func runStoragePerformanceCase(t *testing.T, reporter *PerfCSVReporter, sc stora
 			context.Background(), mgmtNS, metav1.DeleteOptions{})
 	}()
 
-	cfg := ScenarioConfig{
-		StorageName:     sc.StorageName,
-		StorageType:     sc.StorageType,
-		StorageKine:     sc.StorageKine,
-		StorageEtcd:     sc.StorageEtcd,
-		StorageNATS:     sc.StorageNATS,
-		ServiceType:     corev1.ServiceTypeNodePort,
-		ExternalAddress: nodeAddr,
-		APISANs:         nodeAddrs,
-		HCPReplicas:     replicas,
-		K0sVersion:      *k0sVersion,
-		Namespace:       mgmtNS,
+	cfg, err := configurePerfScenario(ctx, sc, clusterName, mgmtNS, nodeAddrs, replicas, *k0sVersion)
+	if err != nil {
+		t.Fatalf("configure scenario: %v", err)
 	}
 
 	t.Logf("[%s] creating HCP (NodePort, replicas=%d)", resultStorageName, replicas)
