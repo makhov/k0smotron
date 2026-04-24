@@ -580,8 +580,8 @@ type KineSpec struct {
 
 // StorageSpec defines the storage backend configuration for the k0s control plane.
 type StorageSpec struct {
-	// Type defines the storage backend type. Can be etcd, kine, or nats.
-	//+kubebuilder:validation:Enum=etcd;kine;nats
+	// Type defines the storage backend type. Can be custom, etcd, kine, or nats.
+	//+kubebuilder:validation:Enum=custom;etcd;kine;nats
 	//+kubebuilder:default=etcd
 	Type StorageType `json:"type,omitempty"`
 	// Kine defines the kine storage configuration.

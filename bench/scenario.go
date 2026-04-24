@@ -23,6 +23,7 @@ import (
 
 	km "github.com/k0sproject/k0smotron/api/k0smotron.io/v1beta2"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // ScenarioConfig holds the parameters for a single benchmark scenario.
@@ -44,9 +45,11 @@ type ScenarioConfig struct {
 	ExternalAddress string
 	// APISANs are merged into k0sConfig.spec.api.sans for the child API server
 	// certificate. Perf NodePort tests include all worker external addresses.
-	APISANs []string
-	Image   string
-	Patches []km.ComponentPatch
+	APISANs   []string
+	K0sConfig map[string]any
+	Image     string
+	Patches   []km.ComponentPatch
+	Resources corev1.ResourceRequirements
 
 	HCPReplicas  int32
 	ClusterCount int
@@ -89,20 +92,47 @@ type RunResult struct {
 type PerfResult struct {
 	Timestamp   time.Time
 	StorageName string
+	Profile     string
 	Concurrency int
 	Ops         int
+	CPULimit    string
+	MemoryLimit string
 
 	// ConfigMap create latency (write path → storage backend write)
 	WriteP50        time.Duration
 	WriteP95        time.Duration
 	WriteP99        time.Duration
 	WriteThroughput float64 // ops/sec
+	WriteSuccesses  int
+	WriteErrors     int
+	WriteErrorRate  float64
 
 	// ConfigMap list latency (read path → storage backend read)
 	ReadP50        time.Duration
 	ReadP95        time.Duration
 	ReadP99        time.Duration
 	ReadThroughput float64 // ops/sec
+	ReadSuccesses  int
+	ReadErrors     int
+	ReadErrorRate  float64
+
+	Watchers       int
+	WatchEvents    int
+	WatchErrors    int
+	WatchEventRate float64
+	WatchLagP50    time.Duration
+	WatchLagP95    time.Duration
+	WatchLagP99    time.Duration
+	WatchLagMax    time.Duration
+
+	// Management-cluster pod resource usage sampled while the perf load runs.
+	HCPResourceSamples int
+	HCPP50MemMi        int64
+	HCPP95MemMi        int64
+	HCPMaxMemMi        int64
+	HCPP50CPUm         int64
+	HCPP95CPUm         int64
+	HCPMaxCPUm         int64
 }
 
 // storageEntry bundles a ScenarioConfig partial with an Enabled flag.
@@ -113,6 +143,38 @@ type storageEntry struct {
 	StorageKine km.KineSpec
 	StorageEtcd km.EtcdSpec
 	StorageNATS km.NATSSpec
+}
+
+func hcpResources(cpuLimit, memoryLimit string) (corev1.ResourceRequirements, error) {
+	resources := corev1.ResourceRequirements{}
+	if cpuLimit != "" {
+		q, err := resource.ParseQuantity(cpuLimit)
+		if err != nil {
+			return resources, err
+		}
+		resources.Requests = ensureResourceList(resources.Requests)
+		resources.Limits = ensureResourceList(resources.Limits)
+		resources.Requests[corev1.ResourceCPU] = q
+		resources.Limits[corev1.ResourceCPU] = q
+	}
+	if memoryLimit != "" {
+		q, err := resource.ParseQuantity(memoryLimit)
+		if err != nil {
+			return resources, err
+		}
+		resources.Requests = ensureResourceList(resources.Requests)
+		resources.Limits = ensureResourceList(resources.Limits)
+		resources.Requests[corev1.ResourceMemory] = q
+		resources.Limits[corev1.ResourceMemory] = q
+	}
+	return resources, nil
+}
+
+func ensureResourceList(list corev1.ResourceList) corev1.ResourceList {
+	if list == nil {
+		return corev1.ResourceList{}
+	}
+	return list
 }
 
 // storageConfigs returns the full list of storage configurations.
@@ -157,7 +219,7 @@ func storageConfigs(k0sVersion string) []storageEntry {
 			},
 		},
 		{
-			StorageName: "nats-embedded",
+			StorageName: "kine-nats-embedded",
 			Enabled:     true,
 			StorageType: km.StorageTypeNATS,
 		},

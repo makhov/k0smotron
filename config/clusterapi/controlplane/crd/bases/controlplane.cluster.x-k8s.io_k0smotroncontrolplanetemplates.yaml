@@ -9861,8 +9861,9 @@ spec:
                           type:
                             default: etcd
                             description: Type defines the storage backend type. Can
-                              be etcd, kine, or nats.
+                              be custom, etcd, kine, or nats.
                             enum:
+                            - custom
                             - etcd
                             - kine
                             - nats

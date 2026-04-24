@@ -1,11 +1,28 @@
 //go:build bench
 
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package bench
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -25,28 +42,29 @@ const (
 	t4EmbeddedK0sImage     = "makhov/k0s"
 	t4EmbeddedK0sVersion   = "v1.35.1-k0s.1-t4-4-amd64"
 	t4DefaultBucket        = "bench-t4"
+	t4DefaultRegion        = "us-east-1"
 	t4DefaultAccessKey     = "benchminio"
 	t4DefaultSecretKey     = "benchminiosecret"
 	t4BusyboxImage         = "busybox:1.36"
+	t4StandaloneChart      = "oci://ghcr.io/t4db/charts/t4"
+	t4StandalonePort       = "2379"
 )
 
 func perfStorageConfigs(k0sVersion string) []storageEntry {
 	configs := append([]storageEntry{}, storageConfigs(k0sVersion)...)
 
-	if t4URL := strings.TrimSpace(os.Getenv("BENCH_T4_URL")); t4URL != "" {
+	if os.Getenv("BENCH_T4_EMBEDDED_ENABLED") != "0" {
 		configs = append(configs, storageEntry{
 			StorageName: "kine-t4",
 			Enabled:     true,
 			StorageType: km.StorageTypeKine,
-			StorageKine: km.KineSpec{DataSourceURL: t4URL},
 		})
 	}
-
-	if os.Getenv("BENCH_T4_EMBEDDED_ENABLED") != "0" {
+	if os.Getenv("BENCH_T4_STANDALONE_ENABLED") != "0" {
 		configs = append(configs, storageEntry{
-			StorageName: "kine-t4-embedded",
+			StorageName: "t4-standalone",
 			Enabled:     true,
-			StorageType: km.StorageTypeKine,
+			StorageType: km.StorageTypeCustom,
 		})
 	}
 
@@ -68,10 +86,17 @@ func configurePerfScenario(ctx context.Context, sc storageEntry, clusterName, na
 		Namespace:       namespace,
 	}
 
-	if sc.StorageName != "kine-t4-embedded" {
+	switch sc.StorageName {
+	case "kine-t4":
+		return configureEmbeddedT4Scenario(ctx, cfg, clusterName, namespace)
+	case "t4-standalone":
+		return configureStandaloneT4Scenario(ctx, cfg, clusterName, namespace, replicas)
+	default:
 		return cfg, nil
 	}
+}
 
+func configureEmbeddedT4Scenario(ctx context.Context, cfg ScenarioConfig, clusterName, namespace string) (ScenarioConfig, error) {
 	bucket := t4BucketName(clusterName)
 	endpoint, accessKey, secretKey, err := ensureT4MinIO(ctx, bucket)
 	if err != nil {
@@ -87,7 +112,7 @@ func configurePerfScenario(ctx context.Context, sc storageEntry, clusterName, na
 	cfg.K0sVersion = envOrDefault("BENCH_T4_EMBEDDED_VERSION", t4EmbeddedK0sVersion)
 	cfg.StorageKine = km.KineSpec{
 		DataSourceURL: fmt.Sprintf(
-			"t4://%s/%s?service-name=%s.%s.svc.cluster.local&data-dir=/tmp/t4&s3-endpoint=%s&segment-max-age=60s",
+			"t4://%s/%s?service-name=%s.%s.svc.cluster.local&data-dir=/tmp/t4&s3-endpoint=%s",
 			bucket,
 			clusterName,
 			headlessServiceName,
@@ -130,6 +155,88 @@ func configurePerfScenario(ctx context.Context, sc storageEntry, clusterName, na
 		},
 	}
 	return cfg, nil
+}
+
+func configureStandaloneT4Scenario(ctx context.Context, cfg ScenarioConfig, clusterName, namespace string, replicas int32) (ScenarioConfig, error) {
+	bucket := t4BucketName(clusterName)
+	endpoint, accessKey, secretKey, err := ensureT4MinIO(ctx, bucket)
+	if err != nil {
+		return cfg, err
+	}
+
+	releaseName := clusterName + "-t4"
+	serviceName := envOrDefault("BENCH_T4_STANDALONE_SERVICE_NAME", releaseName)
+	port := envOrDefault("BENCH_T4_STANDALONE_PORT", t4StandalonePort)
+	if err := ensureStandaloneT4(ctx, namespace, releaseName, bucket, clusterName, endpoint, accessKey, secretKey, replicas, port); err != nil {
+		return cfg, err
+	}
+
+	endpointURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%s", serviceName, namespace, port)
+	cfg.StorageType = km.StorageTypeCustom
+	cfg.K0sConfig = map[string]any{
+		"apiVersion": "k0s.k0sproject.io/v1beta1",
+		"kind":       "ClusterConfig",
+		"spec": map[string]any{
+			"storage": map[string]any{
+				"type": "etcd",
+				"etcd": map[string]any{
+					"externalCluster": map[string]any{
+						"endpoints":  []any{endpointURL},
+						"etcdPrefix": clusterName,
+					},
+				},
+			},
+		},
+	}
+	return cfg, nil
+}
+
+func ensureStandaloneT4(ctx context.Context, namespace, releaseName, bucket, prefix, endpoint, accessKey, secretKey string, replicas int32, port string) error {
+	if err := ensureNamespace(ctx, globalKC, namespace); err != nil {
+		return fmt.Errorf("ensure standalone t4 namespace: %w", err)
+	}
+
+	chart := envOrDefault("BENCH_T4_STANDALONE_CHART", t4StandaloneChart)
+	region := envOrDefault("BENCH_T4_S3_REGION", t4DefaultRegion)
+	args := []string{
+		"upgrade", "--install", releaseName, chart,
+		"--namespace", namespace,
+		"--create-namespace",
+		"--wait",
+		"--timeout", envOrDefault("BENCH_T4_STANDALONE_HELM_TIMEOUT", "10m"),
+		"--set", fmt.Sprintf("replicaCount=%d", replicas),
+		"--set", "persistence.enabled=false",
+		"--set", "config.listenAddr=0.0.0.0:" + port,
+		"--set", "service.port=" + port,
+		"--set", "s3.bucket=" + bucket,
+		"--set", "s3.prefix=" + prefix,
+		"--set", "s3.region=" + region,
+		"--set", "s3.endpoint=" + endpoint,
+		"--set", "s3.credentials.accessKeyId=" + accessKey,
+		"--set", "s3.credentials.secretAccessKey=" + secretKey,
+		"--set", "config.segmentMaxAgeSec=15",
+	}
+	if extraSet := strings.TrimSpace(os.Getenv("BENCH_T4_STANDALONE_HELM_SET")); extraSet != "" {
+		args = append(args, "--set", extraSet)
+	}
+	if version := strings.TrimSpace(os.Getenv("BENCH_T4_STANDALONE_CHART_VERSION")); version != "" {
+		args = append(args, "--version", version)
+	}
+
+	cmd := exec.CommandContext(ctx, envOrDefault("BENCH_HELM_BIN", "helm"), args...)
+	if kubeconfig != nil && *kubeconfig != "" {
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+*kubeconfig)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("install standalone t4 with helm: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	serviceName := envOrDefault("BENCH_T4_STANDALONE_SERVICE_NAME", releaseName)
+	if err := waitServiceEndpoints(ctx, namespace, serviceName, 5*time.Minute); err != nil {
+		return fmt.Errorf("wait standalone t4 service endpoints: %w", err)
+	}
+	return nil
 }
 
 func ensureT4HeadlessService(ctx context.Context, namespace, clusterName, serviceName string) error {
@@ -392,6 +499,31 @@ func waitDeploymentReady(ctx context.Context, namespace, name string, timeout ti
 		}
 		if dep.Status.ReadyReplicas >= 1 {
 			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitServiceEndpoints(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		endpoints, err := globalKC.CoreV1().Endpoints(namespace).Get(waitCtx, name, metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get endpoints %s/%s: %w", namespace, name, err)
+		}
+		if err == nil {
+			for _, subset := range endpoints.Subsets {
+				if len(subset.Addresses) > 0 {
+					return nil
+				}
+			}
 		}
 		select {
 		case <-waitCtx.Done():

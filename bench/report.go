@@ -20,6 +20,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -142,16 +143,40 @@ func fmtSeconds(d time.Duration) string {
 var perfCSVHeader = []string{
 	"timestamp",
 	"storage_name",
+	"profile",
 	"concurrency",
 	"ops",
+	"hcp_cpu_limit",
+	"hcp_memory_limit",
 	"write_p50_s",
 	"write_p95_s",
 	"write_p99_s",
 	"write_throughput_ops",
+	"write_successes",
+	"write_errors",
+	"write_error_rate",
 	"read_p50_s",
 	"read_p95_s",
 	"read_p99_s",
 	"read_throughput_ops",
+	"read_successes",
+	"read_errors",
+	"read_error_rate",
+	"watchers",
+	"watch_events",
+	"watch_errors",
+	"watch_event_rate",
+	"watch_lag_p50_s",
+	"watch_lag_p95_s",
+	"watch_lag_p99_s",
+	"watch_lag_max_s",
+	"hcp_resource_samples",
+	"hcp_p50_mem_mi",
+	"hcp_p95_mem_mi",
+	"hcp_max_mem_mi",
+	"hcp_p50_cpu_m",
+	"hcp_p95_cpu_m",
+	"hcp_max_cpu_m",
 }
 
 // PerfCSVReporter writes PerfResult records to a CSV file.
@@ -163,7 +188,7 @@ type PerfCSVReporter struct {
 
 // NewPerfCSVReporter opens (or creates) path and writes the header row.
 func NewPerfCSVReporter(path string) (*PerfCSVReporter, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open perf report %q: %w", path, err)
 	}
@@ -175,6 +200,18 @@ func NewPerfCSVReporter(path string) (*PerfCSVReporter, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("stat perf report: %w", err)
 	}
+	if fi.Size() > 0 {
+		header, err := csv.NewReader(f).Read()
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("read perf CSV header: %w", err)
+		}
+		if strings.Join(header, ",") != strings.Join(perfCSVHeader, ",") {
+			_ = f.Close()
+			return nil, fmt.Errorf("perf report %q has an old or incompatible header; use a fresh -bench.perf-report path or remove the old file", path)
+		}
+	}
+
 	if fi.Size() == 0 {
 		if err := r.writer.Write(perfCSVHeader); err != nil {
 			_ = f.Close()
@@ -198,16 +235,40 @@ func (r *PerfCSVReporter) Append(res PerfResult) error {
 	row := []string{
 		res.Timestamp.Format(time.RFC3339),
 		res.StorageName,
+		res.Profile,
 		fmt.Sprintf("%d", res.Concurrency),
 		fmt.Sprintf("%d", res.Ops),
+		res.CPULimit,
+		res.MemoryLimit,
 		fmtSeconds(res.WriteP50),
 		fmtSeconds(res.WriteP95),
 		fmtSeconds(res.WriteP99),
 		fmt.Sprintf("%.2f", res.WriteThroughput),
+		fmt.Sprintf("%d", res.WriteSuccesses),
+		fmt.Sprintf("%d", res.WriteErrors),
+		fmt.Sprintf("%.4f", res.WriteErrorRate),
 		fmtSeconds(res.ReadP50),
 		fmtSeconds(res.ReadP95),
 		fmtSeconds(res.ReadP99),
 		fmt.Sprintf("%.2f", res.ReadThroughput),
+		fmt.Sprintf("%d", res.ReadSuccesses),
+		fmt.Sprintf("%d", res.ReadErrors),
+		fmt.Sprintf("%.4f", res.ReadErrorRate),
+		fmt.Sprintf("%d", res.Watchers),
+		fmt.Sprintf("%d", res.WatchEvents),
+		fmt.Sprintf("%d", res.WatchErrors),
+		fmt.Sprintf("%.2f", res.WatchEventRate),
+		fmtSeconds(res.WatchLagP50),
+		fmtSeconds(res.WatchLagP95),
+		fmtSeconds(res.WatchLagP99),
+		fmtSeconds(res.WatchLagMax),
+		fmt.Sprintf("%d", res.HCPResourceSamples),
+		fmt.Sprintf("%d", res.HCPP50MemMi),
+		fmt.Sprintf("%d", res.HCPP95MemMi),
+		fmt.Sprintf("%d", res.HCPMaxMemMi),
+		fmt.Sprintf("%d", res.HCPP50CPUm),
+		fmt.Sprintf("%d", res.HCPP95CPUm),
+		fmt.Sprintf("%d", res.HCPMaxCPUm),
 	}
 
 	if err := r.writer.Write(row); err != nil {

@@ -27,6 +27,31 @@ SCALE_TIMEOUT ?= 4h
 PERF_TIMEOUT  ?= 2h
 PERF_OPS      ?= 500
 PERF_CONCURRENCY ?= 10
+PERF_HCP_CLIENT_QPS ?= 2000
+PERF_HCP_CLIENT_BURST ?= 4000
+PERF_RESOURCE_SAMPLE_INTERVAL ?= 2s
+PERF_REPORT ?= $(BENCH_DIR)bench-perf-results.csv
+PERF_HCP_RESOURCE_PRESET ?= unlimited
+PERF_HCP_CPU_LIMIT ?=
+PERF_HCP_MEMORY_LIMIT ?=
+PERF_REQUEST_TIMEOUT ?= 30s
+PERF_PHASE_TIMEOUT ?= 5m
+PERF_PROFILE ?= create-list
+PERF_WATCHERS ?= 25
+
+PERF_HCP_PRESET_CPU_unlimited :=
+PERF_HCP_PRESET_MEM_unlimited :=
+PERF_HCP_PRESET_CPU_tiny := 250m
+PERF_HCP_PRESET_MEM_tiny := 512Mi
+PERF_HCP_PRESET_CPU_small := 500m
+PERF_HCP_PRESET_MEM_small := 768Mi
+PERF_HCP_PRESET_CPU_medium := 1000m
+PERF_HCP_PRESET_MEM_medium := 1Gi
+PERF_HCP_PRESET_CPU_large := 2000m
+PERF_HCP_PRESET_MEM_large := 2Gi
+
+PERF_HCP_EFFECTIVE_CPU_LIMIT = $(or $(PERF_HCP_CPU_LIMIT),$(PERF_HCP_PRESET_CPU_$(PERF_HCP_RESOURCE_PRESET)))
+PERF_HCP_EFFECTIVE_MEMORY_LIMIT = $(or $(PERF_HCP_MEMORY_LIMIT),$(PERF_HCP_PRESET_MEM_$(PERF_HCP_RESOURCE_PRESET)))
 
 # ── Infra pass-through ────────────────────────────────────────────────────── #
 KEY           ?=
@@ -85,14 +110,17 @@ if [ -z "$${BENCH_POSTGRES_URL:-}" ]; then echo "WARNING: BENCH_POSTGRES_URL not
 if [ -z "$${BENCH_MYSQL_URL:-}" ]; then echo "WARNING: BENCH_MYSQL_URL not set — kine-mysql will be skipped"; fi
 endef
 
-.PHONY: help run scale perf all kubeconfig bench-env infra-up infra-down worker-limits k0smotron-stable deploy-local
+.PHONY: help run scale perf perf-ha perf-unlimited perf-tiny perf-small perf-medium perf-large perf-ha-unlimited perf-ha-tiny perf-ha-small perf-ha-medium perf-ha-large all kubeconfig bench-env infra-up infra-down worker-limits k0smotron-stable deploy-local
 
 help:
 	@echo "Targets:"
 	@echo "  run         provision + scale + perf + destroy  (requires KEY=)"
 	@echo "  scale       run TestScaleMatrix  (auto-fetches kubeconfig)"
-	@echo "  perf        run TestStoragePerformance  (auto-fetches kubeconfig)"
-	@echo "  all         scale + perf"
+	@echo "  perf        run single-node TestStoragePerformance  (auto-fetches kubeconfig)"
+	@echo "  perf-ha     run 3-node TestStoragePerformanceHA  (auto-fetches kubeconfig)"
+	@echo "  perf-{unlimited,tiny,small,medium,large}     run perf with resource preset"
+	@echo "  perf-ha-{unlimited,tiny,small,medium,large}  run HA perf with resource preset"
+	@echo "  all         scale + perf + perf-ha"
 	@echo "  kubeconfig  fetch kubeconfig from observer → $(BENCH_DIR)kubeconfig"
 	@echo ""
 	@echo "  infra-up         provision EC2 cluster (requires KEY=)"
@@ -103,7 +131,11 @@ help:
 	@echo ""
 	@echo "Key vars: KUBECONFIG KEY CIDR BENCH_STORAGE BENCH_LARGE"
 	@echo "          BENCH_PARALLEL BENCH_K0S_VER SCALE_TIMEOUT PERF_TIMEOUT"
-	@echo "          PERF_OPS PERF_CONCURRENCY"
+	@echo "          PERF_OPS PERF_CONCURRENCY PERF_RESOURCE_SAMPLE_INTERVAL PERF_REPORT"
+	@echo "          PERF_HCP_RESOURCE_PRESET PERF_HCP_CPU_LIMIT PERF_HCP_MEMORY_LIMIT"
+	@echo "          PERF_REQUEST_TIMEOUT PERF_PHASE_TIMEOUT"
+	@echo "          PERF_PROFILE PERF_WATCHERS"
+	@echo "          presets: unlimited tiny small medium large"
 	@echo "          BENCH_ENV"
 
 # ── Kubeconfig ────────────────────────────────────────────────────────────── #
@@ -142,13 +174,71 @@ perf: kubeconfig bench-env
 	@$(LOAD_BENCH_ENV); \
 	$(GO_TEST) \
 	  -timeout $(PERF_TIMEOUT) \
-	  -bench.perf-report=$(BENCH_DIR)bench-perf-results.csv \
+	  -bench.perf-report=$(PERF_REPORT) \
 	  -bench.perf-ops=$(PERF_OPS) \
 	  -bench.perf-concurrency=$(PERF_CONCURRENCY) \
-	  -run TestStoragePerformance \
+	  -bench.hcp-client-qps=$(PERF_HCP_CLIENT_QPS) \
+	  -bench.hcp-client-burst=$(PERF_HCP_CLIENT_BURST) \
+	  -bench.resource-sample-interval=$(PERF_RESOURCE_SAMPLE_INTERVAL) \
+	  -bench.request-timeout=$(PERF_REQUEST_TIMEOUT) \
+	  -bench.phase-timeout=$(PERF_PHASE_TIMEOUT) \
+	  -bench.perf-profile=$(PERF_PROFILE) \
+	  -bench.watchers=$(PERF_WATCHERS) \
+	  $(if $(PERF_HCP_EFFECTIVE_CPU_LIMIT),-bench.hcp-cpu-limit=$(PERF_HCP_EFFECTIVE_CPU_LIMIT)) \
+	  $(if $(PERF_HCP_EFFECTIVE_MEMORY_LIMIT),-bench.hcp-memory-limit=$(PERF_HCP_EFFECTIVE_MEMORY_LIMIT)) \
+	  -run '^TestStoragePerformance$$' \
 	  $(BENCH_DIR)
 
-all: scale perf
+perf-ha: kubeconfig bench-env
+	@$(LOAD_BENCH_ENV); \
+	$(GO_TEST) \
+	  -timeout $(PERF_TIMEOUT) \
+	  -bench.perf-report=$(PERF_REPORT) \
+	  -bench.perf-ops=$(PERF_OPS) \
+	  -bench.perf-concurrency=$(PERF_CONCURRENCY) \
+	  -bench.hcp-client-qps=$(PERF_HCP_CLIENT_QPS) \
+	  -bench.hcp-client-burst=$(PERF_HCP_CLIENT_BURST) \
+	  -bench.resource-sample-interval=$(PERF_RESOURCE_SAMPLE_INTERVAL) \
+	  -bench.request-timeout=$(PERF_REQUEST_TIMEOUT) \
+	  -bench.phase-timeout=$(PERF_PHASE_TIMEOUT) \
+	  -bench.perf-profile=$(PERF_PROFILE) \
+	  -bench.watchers=$(PERF_WATCHERS) \
+	  $(if $(PERF_HCP_EFFECTIVE_CPU_LIMIT),-bench.hcp-cpu-limit=$(PERF_HCP_EFFECTIVE_CPU_LIMIT)) \
+	  $(if $(PERF_HCP_EFFECTIVE_MEMORY_LIMIT),-bench.hcp-memory-limit=$(PERF_HCP_EFFECTIVE_MEMORY_LIMIT)) \
+	  -run '^TestStoragePerformanceHA$$' \
+	  $(BENCH_DIR)
+
+perf-unlimited:
+	$(MAKE) perf PERF_HCP_RESOURCE_PRESET=unlimited
+
+perf-tiny:
+	$(MAKE) perf PERF_HCP_RESOURCE_PRESET=tiny
+
+perf-small:
+	$(MAKE) perf PERF_HCP_RESOURCE_PRESET=small
+
+perf-medium:
+	$(MAKE) perf PERF_HCP_RESOURCE_PRESET=medium
+
+perf-large:
+	$(MAKE) perf PERF_HCP_RESOURCE_PRESET=large
+
+perf-ha-unlimited:
+	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=unlimited
+
+perf-ha-tiny:
+	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=tiny
+
+perf-ha-small:
+	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=small
+
+perf-ha-medium:
+	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=medium
+
+perf-ha-large:
+	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=large
+
+all: scale perf perf-ha
 
 bench-env:
 	@mkdir -p "$(BENCH_DIR)"

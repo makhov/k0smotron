@@ -24,6 +24,7 @@ import (
 
 	km "github.com/k0sproject/k0smotron/api/k0smotron.io/v1beta2"
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -72,14 +73,15 @@ type clusterMeta struct {
 }
 
 type clusterSpec struct {
-	Replicas        int32               `json:"replicas"`
-	Image           string              `json:"image,omitempty"`
-	Version         string              `json:"version"`
-	ExternalAddress string              `json:"externalAddress,omitempty"`
-	K0sConfig       map[string]any      `json:"k0sConfig,omitempty"`
-	Patches         []km.ComponentPatch `json:"patches,omitempty"`
-	Service         km.ServiceSpec      `json:"service"`
-	Storage         km.StorageSpec      `json:"storage"`
+	Replicas        int32                       `json:"replicas"`
+	Image           string                      `json:"image,omitempty"`
+	Version         string                      `json:"version"`
+	ExternalAddress string                      `json:"externalAddress,omitempty"`
+	K0sConfig       map[string]any              `json:"k0sConfig,omitempty"`
+	Patches         []km.ComponentPatch         `json:"patches,omitempty"`
+	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
+	Service         km.ServiceSpec              `json:"service"`
+	Storage         km.StorageSpec              `json:"storage"`
 }
 
 // createCluster POSTs a new k0smotron Cluster resource via the raw REST client.
@@ -104,8 +106,9 @@ func createCluster(ctx context.Context, kc *kubernetes.Clientset, name, ns strin
 			Image:           cfg.Image,
 			Version:         cfg.K0sVersion,
 			ExternalAddress: cfg.ExternalAddress,
-			K0sConfig:       k0sConfigWithSANs(cfg.APISANs),
+			K0sConfig:       mergeK0sConfigWithSANs(cfg.K0sConfig, cfg.APISANs),
 			Patches:         cfg.Patches,
+			Resources:       cfg.Resources,
 			Service: km.ServiceSpec{
 				Type:             svcType,
 				APIPort:          hcpAPINodePort,
@@ -134,19 +137,32 @@ func createCluster(ctx context.Context, kc *kubernetes.Clientset, name, ns strin
 		Error()
 }
 
-func k0sConfigWithSANs(sans []string) map[string]any {
-	if len(sans) == 0 {
+func mergeK0sConfigWithSANs(base map[string]any, sans []string) map[string]any {
+	if base == nil && len(sans) == 0 {
 		return nil
 	}
-	return map[string]any{
+	cfg := map[string]any{
 		"apiVersion": "k0s.k0sproject.io/v1beta1",
 		"kind":       "ClusterConfig",
-		"spec": map[string]any{
-			"api": map[string]any{
-				"sans": sans,
-			},
-		},
 	}
+	for k, v := range base {
+		cfg[k] = v
+	}
+
+	spec, _ := cfg["spec"].(map[string]any)
+	if spec == nil {
+		spec = map[string]any{}
+		cfg["spec"] = spec
+	}
+	if len(sans) > 0 {
+		api, _ := spec["api"].(map[string]any)
+		if api == nil {
+			api = map[string]any{}
+			spec["api"] = api
+		}
+		api["sans"] = sans
+	}
+	return cfg
 }
 
 // deleteCluster DELETEs the named k0smotron Cluster resource.
