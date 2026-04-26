@@ -43,6 +43,7 @@ var (
 	perfPhaseTimeout           = flag.Duration("bench.phase-timeout", 5*time.Minute, "maximum duration for each perf load phase")
 	perfProfile                = flag.String("bench.perf-profile", "create-list", "perf profile to run: create-list, watch-churn, or all")
 	perfWatchers               = flag.Int("bench.watchers", 25, "number of concurrent watchers for the watch-churn perf profile")
+	perfWatchDrain             = flag.Duration("bench.watch-drain", 10*time.Second, "maximum time to wait for watch events to drain after watch-churn writes")
 	perfReportPath             = flag.String("bench.perf-report", "bench-perf-results.csv", "CSV output for storage performance results")
 )
 
@@ -276,7 +277,7 @@ func runWatchChurnProfile(t *testing.T, ctx context.Context, hcpKC *kubernetes.C
 		resultStorageName, *perfOps, *perfConcurrency, *perfWarmup, *perfWatchers)
 	start := time.Now()
 	phaseCtx, cancel := context.WithTimeout(ctx, *perfPhaseTimeout)
-	watchResult := runWatchChurnLoad(phaseCtx, hcpKC, loadNS, *perfOps, *perfConcurrency, *perfWarmup, *perfWatchers, *perfRequestTimeout)
+	watchResult := runWatchChurnLoad(phaseCtx, hcpKC, loadNS, *perfOps, *perfConcurrency, *perfWarmup, *perfWatchers, *perfRequestTimeout, *perfWatchDrain)
 	cancel()
 	elapsed := time.Since(start)
 	if watchResult.Churn.FirstErr != nil {
@@ -287,8 +288,22 @@ func runWatchChurnProfile(t *testing.T, ctx context.Context, hcpKC *kubernetes.C
 	lp50, lp95, lp99, lmax := percentiles(watchResult.WatchLags)
 	t.Logf("[%s] churn p50=%s p95=%s p99=%s %.1f lifecycles/s success=%d errors=%d errorRate=%.2f%%",
 		resultStorageName, cp50, cp95, cp99, opsThroughput(watchResult.Churn.Successes, elapsed), watchResult.Churn.Successes, watchResult.Churn.Errors, errorRate(watchResult.Churn.Successes, watchResult.Churn.Errors)*100)
-	t.Logf("[%s] watch events=%d errors=%d eventRate=%.1f/s lag p50=%s p95=%s p99=%s max=%s",
-		resultStorageName, watchResult.WatchEvents, watchResult.WatchErrors, opsThroughput(watchResult.WatchEvents, elapsed), lp50, lp95, lp99, lmax)
+	for _, op := range churnLifecycleOps {
+		s := watchResult.ChurnByOp[op]
+		if s.Errors == 0 && s.Successes == 0 {
+			continue
+		}
+		t.Logf("[%s] churn op=%s success=%d errors=%d errorRate=%.2f%% firstErr=%q",
+			resultStorageName, op, s.Successes, s.Errors,
+			errorRate(s.Successes, s.Errors)*100, truncErr(s.FirstErr, 200))
+	}
+	t.Logf("[%s] watch events=%d errors=%d reconnects=%d firstErr=%q eventRate=%.1f/s lag p50=%s p95=%s p99=%s max=%s",
+		resultStorageName, watchResult.WatchEvents, watchResult.WatchErrors, watchResult.WatchReconnects, truncErr(watchResult.WatchFirstErr, 200), opsThroughput(watchResult.WatchEvents, elapsed), lp50, lp95, lp99, lmax)
+
+	createStat := watchResult.ChurnByOp["create"]
+	update1Stat := watchResult.ChurnByOp["update1"]
+	update2Stat := watchResult.ChurnByOp["update2"]
+	deleteStat := watchResult.ChurnByOp["delete"]
 
 	return PerfResult{
 		WriteP50:        cp50,
@@ -298,15 +313,34 @@ func runWatchChurnProfile(t *testing.T, ctx context.Context, hcpKC *kubernetes.C
 		WriteSuccesses:  watchResult.Churn.Successes,
 		WriteErrors:     watchResult.Churn.Errors,
 		WriteErrorRate:  errorRate(watchResult.Churn.Successes, watchResult.Churn.Errors),
+		CreateErrors:    createStat.Errors,
+		CreateFirstErr:  truncErr(createStat.FirstErr, 200),
+		Update1Errors:   update1Stat.Errors,
+		Update1FirstErr: truncErr(update1Stat.FirstErr, 200),
+		Update2Errors:   update2Stat.Errors,
+		Update2FirstErr: truncErr(update2Stat.FirstErr, 200),
+		DeleteErrors:    deleteStat.Errors,
+		DeleteFirstErr:  truncErr(deleteStat.FirstErr, 200),
 		Watchers:        watchResult.Watchers,
 		WatchEvents:     watchResult.WatchEvents,
 		WatchErrors:     watchResult.WatchErrors,
+		WatchReconnects: watchResult.WatchReconnects,
+		WatchFirstErr:   truncErr(watchResult.WatchFirstErr, 200),
 		WatchEventRate:  opsThroughput(watchResult.WatchEvents, elapsed),
 		WatchLagP50:     lp50,
 		WatchLagP95:     lp95,
 		WatchLagP99:     lp99,
 		WatchLagMax:     lmax,
 	}
+}
+
+// truncErr trims long error strings (CSV / log readability) without changing
+// the head, which is where root-cause text usually lives.
+func truncErr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func errorRate(successes, errors int) float64 {

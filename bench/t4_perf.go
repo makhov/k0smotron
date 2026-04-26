@@ -40,7 +40,7 @@ const (
 	t4MinIOServiceName     = "bench-t4-minio"
 	t4MinIOCredsSecretName = "bench-t4-minio-creds"
 	t4EmbeddedK0sImage     = "makhov/k0s"
-	t4EmbeddedK0sVersion   = "v1.35.1-k0s.1-t4-4-amd64"
+	t4EmbeddedK0sVersion   = "v1.35.1-k0s.1-t4-6-amd64"
 	t4DefaultBucket        = "bench-t4"
 	t4DefaultRegion        = "us-east-1"
 	t4DefaultAccessKey     = "benchminio"
@@ -198,12 +198,18 @@ func ensureStandaloneT4(ctx context.Context, namespace, releaseName, bucket, pre
 
 	chart := envOrDefault("BENCH_T4_STANDALONE_CHART", t4StandaloneChart)
 	region := envOrDefault("BENCH_T4_S3_REGION", t4DefaultRegion)
+	imageRepository := envOrDefault("BENCH_T4_STANDALONE_IMAGE_REPOSITORY", "ghcr.io/t4db/t4")
+	imageTag := envOrDefault("BENCH_T4_STANDALONE_IMAGE_TAG", "latest")
+	imagePullPolicy := envOrDefault("BENCH_T4_STANDALONE_IMAGE_PULL_POLICY", "Always")
 	args := []string{
 		"upgrade", "--install", releaseName, chart,
 		"--namespace", namespace,
 		"--create-namespace",
 		"--wait",
 		"--timeout", envOrDefault("BENCH_T4_STANDALONE_HELM_TIMEOUT", "10m"),
+		"--set-string", "image.repository=" + imageRepository,
+		"--set-string", "image.tag=" + imageTag,
+		"--set-string", "image.pullPolicy=" + imagePullPolicy,
 		"--set", fmt.Sprintf("replicaCount=%d", replicas),
 		"--set", "persistence.enabled=false",
 		"--set", "config.listenAddr=0.0.0.0:" + port,

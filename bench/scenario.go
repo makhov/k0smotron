@@ -107,6 +107,17 @@ type PerfResult struct {
 	WriteErrors     int
 	WriteErrorRate  float64
 
+	// watch-churn per-lifecycle-step error counts and first sampled error.
+	// Always 0 / "" for the create-list profile.
+	CreateErrors    int
+	CreateFirstErr  string
+	Update1Errors   int
+	Update1FirstErr string
+	Update2Errors   int
+	Update2FirstErr string
+	DeleteErrors    int
+	DeleteFirstErr  string
+
 	// ConfigMap list latency (read path → storage backend read)
 	ReadP50        time.Duration
 	ReadP95        time.Duration
@@ -116,14 +127,16 @@ type PerfResult struct {
 	ReadErrors     int
 	ReadErrorRate  float64
 
-	Watchers       int
-	WatchEvents    int
-	WatchErrors    int
-	WatchEventRate float64
-	WatchLagP50    time.Duration
-	WatchLagP95    time.Duration
-	WatchLagP99    time.Duration
-	WatchLagMax    time.Duration
+	Watchers        int
+	WatchEvents     int
+	WatchErrors     int
+	WatchReconnects int
+	WatchFirstErr   string
+	WatchEventRate  float64
+	WatchLagP50     time.Duration
+	WatchLagP95     time.Duration
+	WatchLagP99     time.Duration
+	WatchLagMax     time.Duration
 
 	// Management-cluster pod resource usage sampled while the perf load runs.
 	HCPResourceSamples int
@@ -143,6 +156,34 @@ type storageEntry struct {
 	StorageKine km.KineSpec
 	StorageEtcd km.EtcdSpec
 	StorageNATS km.NATSSpec
+}
+
+func scaleFastProbePatches() []km.ComponentPatch {
+	return []km.ComponentPatch{{
+		Target: km.PatchTarget{
+			Kind:      "StatefulSet",
+			Component: "control-plane",
+		},
+		Patch: km.PatchSpec{
+			Type: km.StrategicMergePatchType,
+			Content: `spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          readinessProbe:
+            initialDelaySeconds: 0
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 300
+          livenessProbe:
+            initialDelaySeconds: 0
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 120
+`,
+		},
+	}}
 }
 
 func hcpResources(cpuLimit, memoryLimit string) (corev1.ResourceRequirements, error) {

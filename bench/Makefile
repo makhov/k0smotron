@@ -38,6 +38,7 @@ PERF_REQUEST_TIMEOUT ?= 30s
 PERF_PHASE_TIMEOUT ?= 5m
 PERF_PROFILE ?= create-list
 PERF_WATCHERS ?= 25
+PERF_WATCH_DRAIN ?= 10s
 
 PERF_HCP_PRESET_CPU_unlimited :=
 PERF_HCP_PRESET_MEM_unlimited :=
@@ -134,7 +135,7 @@ help:
 	@echo "          PERF_OPS PERF_CONCURRENCY PERF_RESOURCE_SAMPLE_INTERVAL PERF_REPORT"
 	@echo "          PERF_HCP_RESOURCE_PRESET PERF_HCP_CPU_LIMIT PERF_HCP_MEMORY_LIMIT"
 	@echo "          PERF_REQUEST_TIMEOUT PERF_PHASE_TIMEOUT"
-	@echo "          PERF_PROFILE PERF_WATCHERS"
+	@echo "          PERF_PROFILE PERF_WATCHERS PERF_WATCH_DRAIN"
 	@echo "          presets: unlimited tiny small medium large"
 	@echo "          BENCH_ENV"
 
@@ -184,6 +185,7 @@ perf: kubeconfig bench-env
 	  -bench.phase-timeout=$(PERF_PHASE_TIMEOUT) \
 	  -bench.perf-profile=$(PERF_PROFILE) \
 	  -bench.watchers=$(PERF_WATCHERS) \
+	  -bench.watch-drain=$(PERF_WATCH_DRAIN) \
 	  $(if $(PERF_HCP_EFFECTIVE_CPU_LIMIT),-bench.hcp-cpu-limit=$(PERF_HCP_EFFECTIVE_CPU_LIMIT)) \
 	  $(if $(PERF_HCP_EFFECTIVE_MEMORY_LIMIT),-bench.hcp-memory-limit=$(PERF_HCP_EFFECTIVE_MEMORY_LIMIT)) \
 	  -run '^TestStoragePerformance$$' \
@@ -203,6 +205,7 @@ perf-ha: kubeconfig bench-env
 	  -bench.phase-timeout=$(PERF_PHASE_TIMEOUT) \
 	  -bench.perf-profile=$(PERF_PROFILE) \
 	  -bench.watchers=$(PERF_WATCHERS) \
+	  -bench.watch-drain=$(PERF_WATCH_DRAIN) \
 	  $(if $(PERF_HCP_EFFECTIVE_CPU_LIMIT),-bench.hcp-cpu-limit=$(PERF_HCP_EFFECTIVE_CPU_LIMIT)) \
 	  $(if $(PERF_HCP_EFFECTIVE_MEMORY_LIMIT),-bench.hcp-memory-limit=$(PERF_HCP_EFFECTIVE_MEMORY_LIMIT)) \
 	  -run '^TestStoragePerformanceHA$$' \

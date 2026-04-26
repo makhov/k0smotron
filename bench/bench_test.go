@@ -124,6 +124,7 @@ func TestScaleMatrix(t *testing.T) {
 					StorageKine:  sc.StorageKine,
 					StorageEtcd:  sc.StorageEtcd,
 					StorageNATS:  sc.StorageNATS,
+					Patches:      scaleFastProbePatches(),
 					ClusterCount: n,
 					Parallelism:  *parallelism,
 					K0sVersion:   *k0sVersion,

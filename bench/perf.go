@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	watchapi "k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -38,7 +39,10 @@ import (
 // to 30443 in the Cluster spec so every HCP is reachable on the same port.
 const hcpAPINodePort = 30443
 
-const watchLagAnnotation = "bench.k0smotron.io/write-ns"
+const (
+	watchLagAnnotation = "bench.k0smotron.io/write-ns"
+	watchRunIDLabel    = "bench.k0smotron.io/run-id"
+)
 
 type loadResult struct {
 	Durations []time.Duration
@@ -53,11 +57,47 @@ type resultWithError struct {
 }
 
 type watchChurnResult struct {
-	Churn       loadResult
-	Watchers    int
-	WatchEvents int
-	WatchErrors int
-	WatchLags   []time.Duration
+	Churn           loadResult
+	ChurnByOp       map[string]opStat // create / update1 / update2 / delete
+	Watchers        int
+	WatchEvents     int
+	WatchErrors     int
+	WatchReconnects int
+	WatchFirstErr   string
+	WatchLags       []time.Duration
+}
+
+// opStat aggregates per-operation success/error counts and a sample of the
+// first error seen — used by watch-churn to localise which step of the
+// create/update/update/delete lifecycle is failing.
+type opStat struct {
+	Successes int
+	Errors    int
+	FirstErr  string
+}
+
+// churnLifecycleOps lists the lifecycle operations in order. The slice order
+// is also the report order so changing it changes log/CSV ordering.
+var churnLifecycleOps = []string{"create", "update1", "update2", "delete"}
+
+// lifecycleErr tags a returned error with the lifecycle step that produced it.
+type lifecycleErr struct {
+	op  string
+	err error
+}
+
+func (e *lifecycleErr) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.op + ": " + e.err.Error()
+}
+
+func (e *lifecycleErr) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 // pickHCPNodeAddress returns a node address reachable from the test runner.
@@ -290,7 +330,7 @@ func runReadLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespace str
 	return measuredLoadResult(results, warmup)
 }
 
-func runWatchChurnLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespace string, ops, concurrency, warmup, watchers int, requestTimeout time.Duration) watchChurnResult {
+func runWatchChurnLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespace string, ops, concurrency, warmup, watchers int, requestTimeout, watchDrain time.Duration) watchChurnResult {
 	if err := ensureHCPNamespace(ctx, hcpKC, namespace); err != nil {
 		return watchChurnResult{
 			Churn:    loadResult{Errors: ops, FirstErr: err},
@@ -300,6 +340,9 @@ func runWatchChurnLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespa
 	if watchers < 1 {
 		watchers = 1
 	}
+	runID := fmt.Sprintf("%d", time.Now().UnixNano())
+	watcherStart := time.Now()
+	labelSelector := fmt.Sprintf("%s=%s", watchRunIDLabel, runID)
 
 	watchCtx, stopWatchers := context.WithCancel(ctx)
 	defer stopWatchers()
@@ -311,7 +354,7 @@ func runWatchChurnLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespa
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runConfigMapWatcher(watchCtx, hcpKC, namespace, ready, &collector)
+			runConfigMapWatcher(watchCtx, hcpKC, namespace, labelSelector, watcherStart, ready, &collector)
 		}()
 	}
 	for i := 0; i < watchers; i++ {
@@ -321,33 +364,72 @@ func runWatchChurnLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespa
 			stopWatchers()
 			wg.Wait()
 			return watchChurnResult{
-				Churn:       loadResult{Errors: ops, FirstErr: ctx.Err()},
-				Watchers:    watchers,
-				WatchEvents: collector.events(),
-				WatchErrors: collector.errors(),
-				WatchLags:   collector.lags(),
+				Churn:           loadResult{Errors: ops, FirstErr: ctx.Err()},
+				Watchers:        watchers,
+				WatchEvents:     collector.events(),
+				WatchErrors:     collector.errors(),
+				WatchReconnects: collector.reconnects(),
+				WatchFirstErr:   collector.firstError(),
+				WatchLags:       collector.lags(),
 			}
 		}
 	}
 
-	churn := runConfigMapChurn(ctx, hcpKC, namespace, ops, concurrency, warmup, requestTimeout)
+	churn, byOp := runConfigMapChurn(ctx, hcpKC, namespace, runID, ops, concurrency, warmup, requestTimeout)
+	waitWatchDrain(ctx, &collector, expectedMeasuredWatchEvents(byOp, watchers), watchDrain)
 	stopWatchers()
 	wg.Wait()
 
 	return watchChurnResult{
-		Churn:       churn,
-		Watchers:    watchers,
-		WatchEvents: collector.events(),
-		WatchErrors: collector.errors(),
-		WatchLags:   collector.lags(),
+		Churn:           churn,
+		ChurnByOp:       byOp,
+		Watchers:        watchers,
+		WatchEvents:     collector.events(),
+		WatchErrors:     collector.errors(),
+		WatchReconnects: collector.reconnects(),
+		WatchFirstErr:   collector.firstError(),
+		WatchLags:       collector.lags(),
+	}
+}
+
+func expectedMeasuredWatchEvents(byOp map[string]opStat, watchers int) int {
+	if watchers < 1 {
+		return 0
+	}
+	var successfulOps int
+	for _, op := range churnLifecycleOps {
+		successfulOps += byOp[op].Successes
+	}
+	return successfulOps * watchers
+}
+
+func waitWatchDrain(ctx context.Context, collector *watchLagCollector, expectedEvents int, maxWait time.Duration) {
+	if expectedEvents <= 0 || maxWait <= 0 {
+		return
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for collector.events() < expectedEvents {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
 type watchLagCollector struct {
-	mu         sync.Mutex
-	lagSamples []time.Duration
-	eventCount int
-	errorCount int
+	mu             sync.Mutex
+	lagSamples     []time.Duration
+	eventCount     int
+	errorCount     int
+	reconnectCount int
+	firstErr       string
 }
 
 func (c *watchLagCollector) addEvent(lag time.Duration) {
@@ -359,10 +441,19 @@ func (c *watchLagCollector) addEvent(lag time.Duration) {
 	}
 }
 
-func (c *watchLagCollector) addError() {
+func (c *watchLagCollector) addError(err string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.errorCount++
+	if c.firstErr == "" {
+		c.firstErr = err
+	}
+}
+
+func (c *watchLagCollector) addReconnect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reconnectCount++
 }
 
 func (c *watchLagCollector) events() int {
@@ -377,6 +468,18 @@ func (c *watchLagCollector) errors() int {
 	return c.errorCount
 }
 
+func (c *watchLagCollector) reconnects() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reconnectCount
+}
+
+func (c *watchLagCollector) firstError() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.firstErr
+}
+
 func (c *watchLagCollector) lags() []time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -385,37 +488,78 @@ func (c *watchLagCollector) lags() []time.Duration {
 	return out
 }
 
-func runConfigMapWatcher(ctx context.Context, hcpKC *kubernetes.Clientset, namespace string, ready chan<- struct{}, collector *watchLagCollector) {
-	watcher, err := hcpKC.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{})
-	select {
-	case ready <- struct{}{}:
-	default:
-	}
-	if err != nil {
-		collector.addError()
-		return
-	}
-	defer watcher.Stop()
-
+func runConfigMapWatcher(ctx context.Context, hcpKC *kubernetes.Clientset, namespace, labelSelector string, watcherStart time.Time, ready chan<- struct{}, collector *watchLagCollector) {
+	var resourceVersion string
+	readySent := false
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				if ctx.Err() == nil {
-					collector.addError()
-				}
+		}
+
+		watcher, err := hcpKC.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{
+			LabelSelector:   labelSelector,
+			ResourceVersion: resourceVersion,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
 				return
 			}
-			recordWatchEvent(event, collector)
+			collector.addError(err.Error())
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		if !readySent {
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			readySent = true
+		}
+
+		resourceVersion = consumeConfigMapWatch(ctx, watcher, resourceVersion, watcherStart, collector)
+		watcher.Stop()
+		if ctx.Err() == nil {
+			collector.addReconnect()
 		}
 	}
 }
 
-func recordWatchEvent(event watchapi.Event, collector *watchLagCollector) {
+func consumeConfigMapWatch(ctx context.Context, watcher watchapi.Interface, resourceVersion string, watcherStart time.Time, collector *watchLagCollector) string {
+	for {
+		select {
+		case <-ctx.Done():
+			return resourceVersion
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				return resourceVersion
+			}
+			if event.Type == watchapi.Error {
+				if ctx.Err() != nil {
+					return resourceVersion
+				}
+				collector.addError(watchErrorString(event))
+				return resourceVersion
+			}
+			if rv := watchResourceVersion(event); rv != "" {
+				resourceVersion = rv
+			}
+			recordWatchEvent(event, watcherStart, collector)
+		}
+	}
+}
+
+func watchResourceVersion(event watchapi.Event) string {
+	accessor, err := apiMeta.Accessor(event.Object)
+	if err != nil {
+		return ""
+	}
+	return accessor.GetResourceVersion()
+}
+
+func recordWatchEvent(event watchapi.Event, watcherStart time.Time, collector *watchLagCollector) {
 	if event.Type == watchapi.Error {
-		collector.addError()
+		collector.addError(watchErrorString(event))
 		return
 	}
 	if event.Type != watchapi.Added && event.Type != watchapi.Modified && event.Type != watchapi.Deleted {
@@ -433,12 +577,27 @@ func recordWatchEvent(event watchapi.Event, collector *watchLagCollector) {
 	if err != nil {
 		return
 	}
-	collector.addEvent(time.Since(time.Unix(0, writeNS)))
+	writeTime := time.Unix(0, writeNS)
+	if writeTime.Before(watcherStart) {
+		return
+	}
+	collector.addEvent(time.Since(writeTime))
 }
 
-func runConfigMapChurn(ctx context.Context, hcpKC *kubernetes.Clientset, namespace string, ops, concurrency, warmup int, requestTimeout time.Duration) loadResult {
+func watchErrorString(event watchapi.Event) string {
+	if err := apierrors.FromObject(event.Object); err != nil {
+		return err.Error()
+	}
+	if status, ok := event.Object.(*metav1.Status); ok && status.Message != "" {
+		return status.Message
+	}
+	return fmt.Sprintf("watch error event object %T", event.Object)
+}
+
+func runConfigMapChurn(ctx context.Context, hcpKC *kubernetes.Clientset, namespace, runID string, ops, concurrency, warmup int, requestTimeout time.Duration) (loadResult, map[string]opStat) {
 	total := warmup + ops
 	results := make([]resultWithError, total)
+	opResults := make([][]string, total) // per-lifecycle: list of ops that succeeded; last entry is the failed op when err != nil
 	sem := make(chan struct{}, concurrency)
 
 	eg, egCtx := errgroup.WithContext(ctx)
@@ -449,40 +608,81 @@ func runConfigMapChurn(ctx context.Context, hcpKC *kubernetes.Clientset, namespa
 			defer func() { <-sem }()
 
 			start := time.Now()
-			err := churnConfigMap(egCtx, hcpKC, namespace, i, requestTimeout)
+			completed, err := churnConfigMap(egCtx, hcpKC, namespace, runID, i, requestTimeout)
 			results[i] = resultWithError{dur: time.Since(start), err: err}
+			opResults[i] = completed
 			return nil
 		})
 	}
 	if err := eg.Wait(); err != nil {
-		return loadResult{Errors: ops, FirstErr: err}
+		return loadResult{Errors: ops, FirstErr: err}, nil
 	}
-	return measuredLoadResult(results, warmup)
+	return measuredLoadResult(results, warmup), aggregateOpStats(results, opResults, warmup)
 }
 
-func churnConfigMap(ctx context.Context, hcpKC *kubernetes.Clientset, namespace string, index int, requestTimeout time.Duration) error {
-	name := fmt.Sprintf("watch-churn-%06d", index)
+// aggregateOpStats walks the measured (post-warmup) lifecycles and computes
+// per-operation Successes / Errors / FirstErr. completed[i] holds, in order,
+// the names of operations that ran in lifecycle i; the last element is the
+// failing op when results[i].err != nil. Successful prior steps in a failed
+// lifecycle still count as op-level successes.
+func aggregateOpStats(results []resultWithError, completed [][]string, warmup int) map[string]opStat {
+	out := map[string]opStat{}
+	for _, op := range churnLifecycleOps {
+		out[op] = opStat{}
+	}
+	for i := warmup; i < len(results); i++ {
+		ops := completed[i]
+		failingOp := ""
+		if results[i].err != nil && len(ops) > 0 {
+			failingOp = ops[len(ops)-1]
+		}
+		for _, op := range ops {
+			s := out[op]
+			if op == failingOp {
+				s.Errors++
+				if s.FirstErr == "" {
+					s.FirstErr = results[i].err.Error()
+				}
+			} else {
+				s.Successes++
+			}
+			out[op] = s
+		}
+	}
+	return out
+}
+
+// churnConfigMap runs one create/update/update/delete lifecycle. Returns the
+// names of operations that ran (in order); when err != nil the final entry is
+// the operation that produced the error.
+func churnConfigMap(ctx context.Context, hcpKC *kubernetes.Clientset, namespace, runID string, index int, requestTimeout time.Duration) ([]string, error) {
+	name := fmt.Sprintf("watch-churn-%s-%06d", runID, index)
+	completed := make([]string, 0, 4)
+
 	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   namespace,
+			Labels:      map[string]string{watchRunIDLabel: runID},
 			Annotations: map[string]string{watchLagAnnotation: fmt.Sprintf("%d", time.Now().UnixNano())},
 		},
 		Data: map[string]string{"index": fmt.Sprintf("%d", index), "phase": "create"},
 	}
+	completed = append(completed, "create")
 	if _, err := hcpKC.CoreV1().ConfigMaps(namespace).Create(reqCtx, cm, metav1.CreateOptions{}); err != nil {
-		return err
+		return completed, &lifecycleErr{op: "create", err: err}
 	}
 
 	reqCtx, cancel = context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	cm.Annotations[watchLagAnnotation] = fmt.Sprintf("%d", time.Now().UnixNano())
 	cm.Data["phase"] = "update"
+	completed = append(completed, "update1")
 	updated, err := hcpKC.CoreV1().ConfigMaps(namespace).Update(reqCtx, cm, metav1.UpdateOptions{})
 	if err != nil {
-		return err
+		return completed, &lifecycleErr{op: "update1", err: err}
 	}
 
 	reqCtx, cancel = context.WithTimeout(ctx, requestTimeout)
@@ -491,14 +691,18 @@ func churnConfigMap(ctx context.Context, hcpKC *kubernetes.Clientset, namespace 
 		updated.Annotations = map[string]string{}
 	}
 	updated.Annotations[watchLagAnnotation] = fmt.Sprintf("%d", time.Now().UnixNano())
-	_, err = hcpKC.CoreV1().ConfigMaps(namespace).Update(reqCtx, updated, metav1.UpdateOptions{})
-	if err != nil {
-		return err
+	completed = append(completed, "update2")
+	if _, err = hcpKC.CoreV1().ConfigMaps(namespace).Update(reqCtx, updated, metav1.UpdateOptions{}); err != nil {
+		return completed, &lifecycleErr{op: "update2", err: err}
 	}
 
 	reqCtx, cancel = context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	return hcpKC.CoreV1().ConfigMaps(namespace).Delete(reqCtx, name, metav1.DeleteOptions{})
+	completed = append(completed, "delete")
+	if err := hcpKC.CoreV1().ConfigMaps(namespace).Delete(reqCtx, name, metav1.DeleteOptions{}); err != nil {
+		return completed, &lifecycleErr{op: "delete", err: err}
+	}
+	return completed, nil
 }
 
 // ensureHCPNamespace creates the namespace inside the HCP cluster if absent.
