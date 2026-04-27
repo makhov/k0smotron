@@ -20,6 +20,7 @@ package bench
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -148,8 +149,9 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 	t.Helper()
 	ctx := context.Background()
 
+	scenarioStart := time.Now().UTC()
 	result := RunResult{
-		Timestamp:    time.Now().UTC(),
+		Timestamp:    scenarioStart,
 		StorageName:  cfg.StorageName,
 		ClusterCount: cfg.ClusterCount,
 		Parallelism:  cfg.Parallelism,
@@ -221,6 +223,53 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 	case <-time.After(30 * time.Second):
 	}
 
+	// 6b. Prom query phase. Run BEFORE churn so the rate windows cover
+	// provision burst + steady-state without the churn-and-cleanup tail
+	// poisoning the gauges (e.g. pg_stat_activity_count drops as clusters are
+	// deleted). Backend-specific instant gauges are wrapped in max_over_time
+	// inside collectPromMetrics so they reflect peak load, not query-time state.
+	if pc, err := newPromClient(globalRC); err != nil {
+		t.Logf("warning: cannot build prom client: %v", err)
+	} else {
+		runWindow := time.Since(scenarioStart)
+		queryAt := time.Now().UTC()
+		pm, err := collectPromMetrics(ctx, pc, queryAt, runWindow)
+		if err != nil {
+			t.Logf("warning: prom query phase failed: %v", err)
+		} else {
+			result.MgmtAPIServerQPS = pm.MgmtAPIServerQPS
+			result.MgmtAPIServerP99LatencyS = pm.MgmtAPIServerP99LatencyS
+			result.MgmtEtcdFsyncP99S = pm.MgmtEtcdFsyncP99S
+			result.MgmtEtcdCommitP99S = pm.MgmtEtcdCommitP99S
+			result.MgmtEtcdLeaderChangesPerSec = pm.MgmtEtcdLeaderChangesPerSec
+			result.OperatorReconcileP95S = pm.OperatorReconcileP95S
+			result.OperatorReconcileErrorsPerSec = pm.OperatorReconcileErrorsPerSec
+			result.OperatorWorkqueueDepthMax = pm.OperatorWorkqueueDepthMax
+			result.WorkerCPUMaxPct = pm.WorkerCPUMaxPct
+			result.WorkerMemMaxPct = pm.WorkerMemMaxPct
+			internals := map[string]float64{}
+			switch cfg.StorageName {
+			case "kine-postgres":
+				internals["pg_active_conn"] = pm.DBPostgresActiveConn
+				internals["pg_xact_commit_per_s"] = pm.DBPostgresXactCommitPerSec
+				internals["pg_deadlocks_per_s"] = pm.DBPostgresDeadlocksPerSec
+			case "kine-mysql":
+				internals["mysql_threads_connected"] = pm.DBMysqlThreadsConnected
+				internals["mysql_innodb_row_lock_ms"] = pm.DBMysqlInnodbRowLockTimeMs
+				internals["mysql_slow_queries_per_s"] = pm.DBMysqlSlowQueriesPerSec
+			}
+			if len(internals) > 0 {
+				if b, err := json.Marshal(internals); err == nil {
+					result.StorageInternalsJSON = string(b)
+				}
+			}
+			t.Logf("prom: apiserver_qps=%.0f apiserver_p99=%.3fs etcd_fsync_p99=%.3fs reconcile_p95=%.3fs workqueue_max=%.0f worker_cpu=%.1f%% internals=%s",
+				pm.MgmtAPIServerQPS, pm.MgmtAPIServerP99LatencyS,
+				pm.MgmtEtcdFsyncP99S, pm.OperatorReconcileP95S,
+				pm.OperatorWorkqueueDepthMax, pm.WorkerCPUMaxPct, result.StorageInternalsJSON)
+		}
+	}
+
 	// 7. Churn: delete 10% of clusters, recreate, measure recovery.
 	churnCount := cfg.ClusterCount / 10
 	if churnCount < 1 {
@@ -244,22 +293,16 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 		result.HCPP95MemMi = agg.HCP.P95MemMi
 		result.HCPTotalCPUm = agg.HCP.TotalCPUm
 		result.HCPTotalMemMi = agg.HCP.TotalMemMi
-		result.EtcdP50CPUm = agg.Etcd.P50CPUm
-		result.EtcdP50MemMi = agg.Etcd.P50MemMi
-		result.EtcdP95MemMi = agg.Etcd.P95MemMi
-		result.EtcdTotalCPUm = agg.Etcd.TotalCPUm
-		result.EtcdTotalMemMi = agg.Etcd.TotalMemMi
-		result.DBP50CPUm = agg.DB.P50CPUm
-		result.DBP50MemMi = agg.DB.P50MemMi
-		result.DBP95MemMi = agg.DB.P95MemMi
-		result.DBTotalCPUm = agg.DB.TotalCPUm
-		result.DBTotalMemMi = agg.DB.TotalMemMi
+		result.StorageP50CPUm = agg.Storage.P50CPUm
+		result.StorageP50MemMi = agg.Storage.P50MemMi
+		result.StorageP95MemMi = agg.Storage.P95MemMi
+		result.StorageTotalCPUm = agg.Storage.TotalCPUm
+		result.StorageTotalMemMi = agg.Storage.TotalMemMi
 		result.OperatorCPUm = agg.OperatorCPUm
 		result.OperatorMemMi = agg.OperatorMemMi
-		t.Logf("metrics: hcp=%dpods/%dsamples etcd=%dpods/%dsamples db=%dpods/%dsamples operator=%dsamples",
+		t.Logf("metrics: hcp=%dpods/%dsamples storage=%dpods (etcd=%d db=%d)/%dsamples operator=%dsamples",
 			agg.HCP.PodCount, agg.HCP.Samples,
-			agg.Etcd.PodCount, agg.Etcd.Samples,
-			agg.DB.PodCount, agg.DB.Samples,
+			agg.Storage.PodCount, agg.EtcdPodCount, agg.DBPodCount, agg.Storage.Samples,
 			agg.OperatorSamples)
 	}
 

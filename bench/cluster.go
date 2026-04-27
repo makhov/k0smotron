@@ -177,8 +177,19 @@ func deleteCluster(ctx context.Context, kc *kubernetes.Clientset, name, ns strin
 		Error()
 }
 
+// waitClusterDeleted waits until the Cluster CR and the child resources owned
+// by it are fully gone. Recreating a Cluster while children (kmc-<name> STS,
+// <name>-sa cert secret, kubeconfig secret) are still being GC'd causes a
+// race: the operator's LookupCached finds the still-alive <name>-sa secret,
+// keeps the existing keypair, and does NOT regenerate. K8s GC then deletes
+// that secret because its owner ref points at the old Cluster UID. The new
+// STS pod ends up stuck on `MountVolume.SetUp failed for volume "certs":
+// secret "<name>-sa" not found`. Waiting for children here avoids the race.
 func waitClusterDeleted(ctx context.Context, kc *kubernetes.Clientset, name, ns string) error {
 	path := fmt.Sprintf("/apis/k0smotron.io/v1beta2/namespaces/%s/clusters/%s", ns, name)
+	stsName := "kmc-" + name
+	saSecretName := name + "-sa"
+	kubeconfigSecretName := name + "-kubeconfig"
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -188,11 +199,27 @@ func waitClusterDeleted(ctx context.Context, kc *kubernetes.Clientset, name, ns 
 			AbsPath(path).
 			Do(ctx).
 			Error()
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
+		crGone := apierrors.IsNotFound(err)
+		if err != nil && !crGone {
 			return fmt.Errorf("get cluster %s while waiting for deletion: %w", name, err)
+		}
+
+		if crGone {
+			stsGone, err := isNotFound(kc.AppsV1().StatefulSets(ns).Get(ctx, stsName, metav1.GetOptions{}))
+			if err != nil {
+				return fmt.Errorf("get statefulset %s while waiting for deletion: %w", stsName, err)
+			}
+			saGone, err := isNotFound(kc.CoreV1().Secrets(ns).Get(ctx, saSecretName, metav1.GetOptions{}))
+			if err != nil {
+				return fmt.Errorf("get secret %s while waiting for deletion: %w", saSecretName, err)
+			}
+			kcGone, err := isNotFound(kc.CoreV1().Secrets(ns).Get(ctx, kubeconfigSecretName, metav1.GetOptions{}))
+			if err != nil {
+				return fmt.Errorf("get secret %s while waiting for deletion: %w", kubeconfigSecretName, err)
+			}
+			if stsGone && saGone && kcGone {
+				return nil
+			}
 		}
 
 		select {
@@ -201,6 +228,19 @@ func waitClusterDeleted(ctx context.Context, kc *kubernetes.Clientset, name, ns 
 		case <-ticker.C:
 		}
 	}
+}
+
+// isNotFound returns (true, nil) when err is a NotFound, (false, nil) when the
+// object exists, and (false, err) for any other error. The first return value
+// of the wrapped Get is intentionally discarded — only the error matters.
+func isNotFound(_ any, err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 // waitClusterReady polls the StatefulSet for the cluster until all desired replicas are ready.

@@ -48,8 +48,22 @@ if ! blkid "$DATA_DEVICE" > /dev/null 2>&1; then
   mkfs.ext4 -F "$DATA_DEVICE"
 fi
 
+# udev needs a moment to repopulate after mkfs; without this blkid -s UUID
+# can return empty, which would write 'UUID= ...' into fstab and break mount.
+udevadm settle
+
+DATA_UUID=""
+for i in $(seq 1 30); do
+  DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE" || true)
+  [ -n "$DATA_UUID" ] && break
+  sleep 1
+done
+if [ -z "$DATA_UUID" ]; then
+  echo "ERROR: blkid never returned UUID for $DATA_DEVICE" >&2
+  exit 1
+fi
+
 mkdir -p /var/lib/postgres-data
-DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
 echo "UUID=$DATA_UUID /var/lib/postgres-data ext4 defaults,noatime 0 2" >> /etc/fstab
 mount -a
 

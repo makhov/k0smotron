@@ -82,7 +82,7 @@ spec:
 EOF
 
   # ---- Primary controller ---------------------------------------------------
-  k0s install controller --enable-worker=false --config /etc/k0s.yaml
+  k0s install controller --enable-worker=false --enable-metrics-scraper --config /etc/k0s.yaml
   k0s start
 
   echo "Waiting for k0s API..."
@@ -122,7 +122,7 @@ else
     sleep 5
   done
 
-  k0s install controller --token-file /tmp/controller-token --enable-worker=false
+  k0s install controller --token-file /tmp/controller-token --enable-worker=false --enable-metrics-scraper
   k0s start
   echo "Joined as secondary controller."
 fi

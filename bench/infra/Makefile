@@ -61,18 +61,20 @@ SCP           = scp $(SSH_OPTS)
 # Targets
 # --------------------------------------------------------------------------- #
 
-.PHONY: help all provision wait monitoring storage k0smotron-stable worker-limits bench \
+.PHONY: help all infra-up run provision wait monitoring storage k0smotron-stable monitoring-extras worker-limits bench \
         prom-snapshot destroy image manifests deploy-local
 
 help:
 	@echo "Usage: make <target> [KEY=...] [CIDR=...]"
 	@echo ""
-	@echo "  all           provision + wait + monitoring + bench"
+	@echo "  run           infra-up + bench (full pipeline; alias of 'all')"
+	@echo "  infra-up      provision + wait + monitoring + storage + k0smotron + monitoring-extras"
 	@echo "  provision     terraform apply (requires KEY=<ec2-key-pair>)"
-	@echo "  wait          wait for observer cloud-init to complete"
+	@echo "  wait          wait for observer cloud-init + storage nodes Ready"
 	@echo "  monitoring        install cert-manager + metrics-server + Prometheus"
 	@echo "  storage           apply postgres + mysql StatefulSets on the tainted storage nodes"
 	@echo "  k0smotron-stable  install stable k0smotron from docs.k0smotron.io"
+	@echo "  monitoring-extras apply ServiceMonitors for k0s-pushgateway + k0smotron operator"
 	@echo "  worker-limits     raise worker node file-descriptor limits and restart k0s workers"
 	@echo "  deploy-local      build + push local k0smotron image + apply local install.yaml"
 	@echo "  bench         run go test -tags bench (CSV written by the test itself)"
@@ -82,7 +84,14 @@ help:
 	@echo "Override vars: KEY CIDR SSH_KEY LOCAL_IMG BENCH_TIMEOUT BENCH_PARALLEL"
 	@echo "               BENCH_K0S_VER BENCH_STORAGE BENCH_LARGE"
 
-all: provision wait monitoring storage k0smotron-stable bench
+# Default end-to-end flow.
+all: run
+
+# Stand up the cluster and everything needed to bench against it. No tests yet.
+infra-up: provision wait monitoring storage k0smotron-stable monitoring-extras
+
+# Full pipeline: infra + benchmark.
+run: infra-up bench
 
 # --------------------------------------------------------------------------- #
 
@@ -175,6 +184,21 @@ monitoring:
 	    --wait --timeout 10m'; \
 	echo "Cluster support stack ready. Deploy k0smotron via: make k0smotron-stable OR make deploy-local"
 
+# Apply ServiceMonitors so kube-prometheus-stack scrapes:
+#   - k0smotron operator metrics (Service appended to install.yaml by `manifests`)
+#   - k0s-pushgateway exposing kube-scheduler / kube-controller-manager / etcd / kine
+# Postgres + mysql exporter ServiceMonitors live in storage manifests, applied
+# separately via `make storage`.
+monitoring-extras:
+	@OBSERVER_IP=$$(cd $(TF_DIR) && terraform output -raw observer_ip); \
+	test -n "$$OBSERVER_IP" || { echo "ERROR: observer_ip empty"; exit 1; }; \
+	echo "Copying monitoring manifests to $$OBSERVER_IP..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'rm -rf ~/monitoring-manifests && mkdir -p ~/monitoring-manifests'; \
+	scp $(SSH_OPTS) -r $(TF_DIR)manifests/monitoring/. ubuntu@$$OBSERVER_IP:~/monitoring-manifests/; \
+	echo "Applying..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'kubectl apply -k ~/monitoring-manifests; \
+	  kubectl -n monitoring get servicemonitor'
+
 # Apply storage backend manifests (postgres + mysql StatefulSets on the
 # tainted db=postgres / db=mysql nodes provisioned by terraform).
 # We scp the local manifests directory so the observer always uses the
@@ -183,11 +207,15 @@ storage:
 	@OBSERVER_IP=$$(cd $(TF_DIR) && terraform output -raw observer_ip); \
 	test -n "$$OBSERVER_IP" || { echo "ERROR: observer_ip empty"; exit 1; }; \
 	echo "Copying storage manifests to $$OBSERVER_IP..."; \
-	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'rm -rf ~/storage-manifests && mkdir -p ~/storage-manifests'; \
-	scp $(SSH_OPTS) -r $(TF_DIR)manifests/storage/. ubuntu@$$OBSERVER_IP:~/storage-manifests/; \
-	echo "Applying..."; \
-	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'kubectl apply -k ~/storage-manifests; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'rm -rf ~/storage-manifests' || exit 1; \
+	scp $(SSH_OPTS) -r $(TF_DIR)manifests/storage ubuntu@$$OBSERVER_IP:~/storage-manifests || exit 1; \
+	echo "Applying manifests..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'set -e; \
+	  ls -la ~/storage-manifests; \
+	  kubectl apply -k ~/storage-manifests; \
+	  echo "Waiting for postgres rollout..."; \
 	  kubectl -n bench-storage rollout status statefulset/postgres --timeout=10m; \
+	  echo "Waiting for mysql rollout..."; \
 	  kubectl -n bench-storage rollout status statefulset/mysql    --timeout=10m; \
 	  kubectl -n bench-storage get pods,pvc'
 
@@ -308,6 +336,11 @@ manifests:
 	# image is imported locally on workers, not pulled from registry
 	sed -i.bak 's/imagePullPolicy: IfNotPresent/imagePullPolicy: Never/g' $(INSTALL_YAML)
 	sed -i.bak 's/imagePullPolicy: Always/imagePullPolicy: Never/g' $(INSTALL_YAML)
+	# Expose controller-runtime diagnostics endpoint on all interfaces so a
+	# Service + ServiceMonitor can reach /metrics. Default binds to localhost.
+	# The Service + ServiceMonitor live in manifests/monitoring/ and are applied
+	# by `make monitoring-extras` after the operator is up.
+	sed -i.bak 's|--diagnostics-address=127.0.0.1:8080|--diagnostics-address=:8080|g' $(INSTALL_YAML)
 	rm -f $(INSTALL_YAML).bak
 	@echo "Manifest: $(INSTALL_YAML)"
 

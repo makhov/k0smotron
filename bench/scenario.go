@@ -56,9 +56,10 @@ type ScenarioConfig struct {
 	K0sVersion   string
 	Namespace    string
 
-	// StorageNamespace is the namespace where the external storage backend (postgres/mysql)
-	// runs as a pod. Empty for in-namespace backends (etcd, kine-sqlite, kine-nats).
-	// When set, the metrics sampler also polls this namespace and reports db_* columns.
+	// StorageNamespace is the namespace where the storage backend runs as a
+	// pod (postgres/mysql Deployments). Empty for in-namespace backends like
+	// etcd, kine-sqlite, kine-nats, kine-t4. When set, the metrics sampler
+	// also polls this namespace and reports db_* columns.
 	StorageNamespace string
 }
 
@@ -84,21 +85,15 @@ type RunResult struct {
 	HCPP50CPUm    int64 // per-pod median peak CPU in millicores
 	HCPTotalCPUm  int64 // sum of per-pod peaks
 
-	// Etcd backend pods (kmc-*-etcd-N), present only when StorageType=etcd.
-	// Same shape as HCP fields. Zero for kine-* scenarios.
-	EtcdP50MemMi   int64
-	EtcdP95MemMi   int64
-	EtcdTotalMemMi int64
-	EtcdP50CPUm    int64
-	EtcdTotalCPUm  int64
-
-	// External DB pods (postgres / mysql) sampled from cfg.StorageNamespace.
-	// Zero for backends that don't use an external DB.
-	DBP50MemMi   int64
-	DBP95MemMi   int64
-	DBTotalMemMi int64
-	DBP50CPUm    int64
-	DBTotalCPUm  int64
+	// Storage backend pods, regardless of which kind. For etcd backend this is
+	// the per-HCP kmc-*-etcd-N StatefulSets (N pods at scale). For kine-postgres
+	// and kine-mysql this is the single shared pod in cfg.StorageNamespace. Zero
+	// for in-process backends (kine-sqlite, kine-nats, kine-t4).
+	StorageP50MemMi   int64
+	StorageP95MemMi   int64
+	StorageTotalMemMi int64
+	StorageP50CPUm    int64
+	StorageTotalCPUm  int64
 
 	// Operator peak resource usage across the run.
 	OperatorMemMi int64
@@ -107,6 +102,30 @@ type RunResult struct {
 	// Churn recovery latency percentiles.
 	ChurnRecoveryP50 time.Duration
 	ChurnRecoveryP95 time.Duration
+
+	// Prom-derived metrics for the scenario time window. Zero when Prom is
+	// unreachable or the metric source isn't scraped (e.g. DBPostgres* /
+	// DBMysql* fields are only populated for the matching kine-postgres /
+	// kine-mysql scenarios).
+	MgmtAPIServerQPS         float64
+	MgmtAPIServerP99LatencyS float64
+
+	MgmtEtcdFsyncP99S           float64
+	MgmtEtcdCommitP99S          float64
+	MgmtEtcdLeaderChangesPerSec float64
+
+	OperatorReconcileP95S         float64
+	OperatorReconcileErrorsPerSec float64
+	OperatorWorkqueueDepthMax     float64
+
+	WorkerCPUMaxPct float64
+	WorkerMemMaxPct float64
+
+	// StorageInternalsJSON carries backend-specific stats that don't compare
+	// across storage types — postgres `pg_stat_*`, mysql `SHOW GLOBAL STATUS`,
+	// etc. Encoded as a JSON object so a single CSV column holds all variants
+	// without forcing per-backend column proliferation.
+	StorageInternalsJSON string
 }
 
 // PerfResult holds API latency and throughput measurements for one storage backend.
@@ -178,7 +197,7 @@ type storageEntry struct {
 	StorageKine      km.KineSpec
 	StorageEtcd      km.EtcdSpec
 	StorageNATS      km.NATSSpec
-	StorageNamespace string // populated for kine-postgres / kine-mysql; empty otherwise.
+	StorageNamespace string // populated for backends that run a DB pod (kine-postgres / kine-mysql); empty otherwise.
 }
 
 func scaleFastProbePatches() []km.ComponentPatch {
@@ -242,8 +261,6 @@ func ensureResourceList(list corev1.ResourceList) corev1.ResourceList {
 }
 
 // storageConfigs returns the full list of storage configurations.
-// Postgres + MySQL run as pods in the bench-storage namespace, reachable via
-// in-cluster Service DNS — see bench/infra/manifests/storage/.
 func storageConfigs(k0sVersion string) []storageEntry {
 	_ = k0sVersion // reserved for future version-specific config adjustments
 

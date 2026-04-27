@@ -152,13 +152,17 @@ type bucketStats struct {
 }
 
 // metricsAggregate is the final summary produced by metricsSampler.Aggregate.
+// Storage merges etcd-backend pods (kmc-*-etcd-N in the HCP namespace) and
+// external DB pods (postgres/mysql in cfg.StorageNamespace) into a single
+// bucket — both are "the storage backend" for the scenario.
 type metricsAggregate struct {
 	HCP             bucketStats
-	Etcd            bucketStats
-	DB              bucketStats
+	Storage         bucketStats
 	OperatorCPUm    int64
 	OperatorMemMi   int64
 	OperatorSamples int
+	EtcdPodCount    int // exposed separately for logging only
+	DBPodCount      int
 }
 
 // classifyHCPPod returns true when the pod belongs to the etcd StatefulSet
@@ -271,13 +275,23 @@ func (s *metricsSampler) Aggregate() metricsAggregate {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Merge etcd + db pods into one "storage" bucket.
+	storage := make(map[string]*podPeak, len(s.etcd)+len(s.db))
+	for k, v := range s.etcd {
+		storage[k] = v
+	}
+	for k, v := range s.db {
+		storage[k] = v
+	}
+
 	return metricsAggregate{
 		HCP:             summarize(s.hcp),
-		Etcd:            summarize(s.etcd),
-		DB:              summarize(s.db),
+		Storage:         summarize(storage),
 		OperatorCPUm:    s.operator.cpuMillis,
 		OperatorMemMi:   s.operator.memMiB,
 		OperatorSamples: s.operator.samples,
+		EtcdPodCount:    len(s.etcd),
+		DBPodCount:      len(s.db),
 	}
 }
 

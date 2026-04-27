@@ -40,20 +40,26 @@ var csvHeader = []string{
 	"hcp_total_mem_mi",
 	"hcp_p50_cpu_m",
 	"hcp_total_cpu_m",
-	"etcd_p50_mem_mi",
-	"etcd_p95_mem_mi",
-	"etcd_total_mem_mi",
-	"etcd_p50_cpu_m",
-	"etcd_total_cpu_m",
-	"db_p50_mem_mi",
-	"db_p95_mem_mi",
-	"db_total_mem_mi",
-	"db_p50_cpu_m",
-	"db_total_cpu_m",
+	"storage_p50_mem_mi",
+	"storage_p95_mem_mi",
+	"storage_total_mem_mi",
+	"storage_p50_cpu_m",
+	"storage_total_cpu_m",
 	"operator_mem_mi",
 	"operator_cpu_m",
 	"churn_recovery_p50_s",
 	"churn_recovery_p95_s",
+	"mgmt_apiserver_qps",
+	"mgmt_apiserver_p99_s",
+	"mgmt_etcd_fsync_p99_s",
+	"mgmt_etcd_commit_p99_s",
+	"mgmt_etcd_leader_changes_per_s",
+	"op_reconcile_p95_s",
+	"op_reconcile_err_per_s",
+	"op_workqueue_depth_max",
+	"worker_cpu_max_pct",
+	"worker_mem_max_pct",
+	"storage_internals_json",
 }
 
 // CSVReporter writes RunResult records to a CSV file.
@@ -117,20 +123,26 @@ func (r *CSVReporter) Append(res RunResult) error {
 		fmt.Sprintf("%d", res.HCPTotalMemMi),
 		fmt.Sprintf("%d", res.HCPP50CPUm),
 		fmt.Sprintf("%d", res.HCPTotalCPUm),
-		fmt.Sprintf("%d", res.EtcdP50MemMi),
-		fmt.Sprintf("%d", res.EtcdP95MemMi),
-		fmt.Sprintf("%d", res.EtcdTotalMemMi),
-		fmt.Sprintf("%d", res.EtcdP50CPUm),
-		fmt.Sprintf("%d", res.EtcdTotalCPUm),
-		fmt.Sprintf("%d", res.DBP50MemMi),
-		fmt.Sprintf("%d", res.DBP95MemMi),
-		fmt.Sprintf("%d", res.DBTotalMemMi),
-		fmt.Sprintf("%d", res.DBP50CPUm),
-		fmt.Sprintf("%d", res.DBTotalCPUm),
+		fmt.Sprintf("%d", res.StorageP50MemMi),
+		fmt.Sprintf("%d", res.StorageP95MemMi),
+		fmt.Sprintf("%d", res.StorageTotalMemMi),
+		fmt.Sprintf("%d", res.StorageP50CPUm),
+		fmt.Sprintf("%d", res.StorageTotalCPUm),
 		fmt.Sprintf("%d", res.OperatorMemMi),
 		fmt.Sprintf("%d", res.OperatorCPUm),
 		fmtSeconds(res.ChurnRecoveryP50),
 		fmtSeconds(res.ChurnRecoveryP95),
+		fmtFloat(res.MgmtAPIServerQPS),
+		fmtFloat(res.MgmtAPIServerP99LatencyS),
+		fmtFloat(res.MgmtEtcdFsyncP99S),
+		fmtFloat(res.MgmtEtcdCommitP99S),
+		fmtFloat(res.MgmtEtcdLeaderChangesPerSec),
+		fmtFloat(res.OperatorReconcileP95S),
+		fmtFloat(res.OperatorReconcileErrorsPerSec),
+		fmtFloat(res.OperatorWorkqueueDepthMax),
+		fmtFloat(res.WorkerCPUMaxPct),
+		fmtFloat(res.WorkerMemMaxPct),
+		res.StorageInternalsJSON,
 	}
 
 	if err := r.writer.Write(row); err != nil {
@@ -156,6 +168,11 @@ func (r *CSVReporter) Close() error {
 // fmtSeconds formats a duration as a decimal seconds string (e.g. "12.345").
 func fmtSeconds(d time.Duration) string {
 	return fmt.Sprintf("%.3f", d.Seconds())
+}
+
+// fmtFloat formats a Prom-derived float with 3 decimal places.
+func fmtFloat(f float64) string {
+	return fmt.Sprintf("%.3f", f)
 }
 
 // ── Storage performance reporter ─────────────────────────────────────────────

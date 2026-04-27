@@ -86,32 +86,26 @@ GO_TEST = go test -tags bench -v \
   $(BENCH_LARGE)
 
 define LOAD_BENCH_ENV
-BENCH_POSTGRES_URL_OVERRIDE=$${BENCH_POSTGRES_URL:-}; \
-BENCH_MYSQL_URL_OVERRIDE=$${BENCH_MYSQL_URL:-}; \
 BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE=$${BENCH_WORKER_EXTERNAL_ADDRESSES:-}; \
 if [ -f "$(BENCH_ENV)" ]; then \
   set -a; . "$(BENCH_ENV)"; set +a; \
 fi; \
-if [ -z "$${BENCH_POSTGRES_URL:-}" ] || [ -z "$${BENCH_MYSQL_URL:-}" ] || [ -z "$${BENCH_WORKER_EXTERNAL_ADDRESSES:-}" ]; then \
+if [ -z "$${BENCH_WORKER_EXTERNAL_ADDRESSES:-}" ]; then \
   TF_ENV=$$(cd "$(INFRA_DIR)" && terraform output -raw bench_env 2>/dev/null \
     | awk '/^[[:space:]]*export[[:space:]]+BENCH_/ { sub(/^[[:space:]]*/, ""); print }'); \
   if [ -n "$$TF_ENV" ]; then \
     eval "$$TF_ENV"; \
-    export BENCH_POSTGRES_URL BENCH_MYSQL_URL BENCH_WORKER_EXTERNAL_ADDRESSES; \
+    export BENCH_WORKER_EXTERNAL_ADDRESSES; \
   fi; \
 fi; \
 if [ -z "$${BENCH_WORKER_EXTERNAL_ADDRESSES:-}" ]; then \
   WORKER_ADDRS=$$(cd "$(INFRA_DIR)" && terraform output -json worker_ips 2>/dev/null | jq -r 'join(",")' 2>/dev/null || true); \
   if [ -n "$$WORKER_ADDRS" ]; then export BENCH_WORKER_EXTERNAL_ADDRESSES="$$WORKER_ADDRS"; fi; \
 fi; \
-if [ -n "$$BENCH_POSTGRES_URL_OVERRIDE" ]; then export BENCH_POSTGRES_URL="$$BENCH_POSTGRES_URL_OVERRIDE"; fi; \
-if [ -n "$$BENCH_MYSQL_URL_OVERRIDE" ]; then export BENCH_MYSQL_URL="$$BENCH_MYSQL_URL_OVERRIDE"; fi; \
-if [ -n "$$BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE" ]; then export BENCH_WORKER_EXTERNAL_ADDRESSES="$$BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE"; fi; \
-if [ -z "$${BENCH_POSTGRES_URL:-}" ]; then echo "WARNING: BENCH_POSTGRES_URL not set — kine-postgres will be skipped"; fi; \
-if [ -z "$${BENCH_MYSQL_URL:-}" ]; then echo "WARNING: BENCH_MYSQL_URL not set — kine-mysql will be skipped"; fi
+if [ -n "$$BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE" ]; then export BENCH_WORKER_EXTERNAL_ADDRESSES="$$BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE"; fi
 endef
 
-.PHONY: help run scale perf perf-ha perf-unlimited perf-tiny perf-small perf-medium perf-large perf-ha-unlimited perf-ha-tiny perf-ha-small perf-ha-medium perf-ha-large all kubeconfig bench-env infra-up infra-down worker-limits k0smotron-stable deploy-local
+.PHONY: help run scale perf perf-ha perf-unlimited perf-tiny perf-small perf-medium perf-large perf-ha-unlimited perf-ha-tiny perf-ha-small perf-ha-medium perf-ha-large all kubeconfig bench-env infra-up infra-down worker-limits k0smotron-stable deploy-local storage monitoring-extras
 
 help:
 	@echo "Targets:"
@@ -124,7 +118,9 @@ help:
 	@echo "  all         scale + perf + perf-ha"
 	@echo "  kubeconfig  fetch kubeconfig from observer → $(BENCH_DIR)kubeconfig"
 	@echo ""
-	@echo "  infra-up         provision EC2 cluster (requires KEY=)"
+	@echo "  infra-up         provision EC2 cluster + storage backends (requires KEY=)"
+	@echo "  storage          apply postgres + mysql StatefulSets on the storage nodes"
+	@echo "  monitoring-extras apply ServiceMonitors for k0s-pushgateway + operator"
 	@echo "  worker-limits    raise worker node file-descriptor limits"
 	@echo "  k0smotron-stable install stable k0smotron from docs.k0smotron.io"
 	@echo "  deploy-local     build + deploy local k0smotron image to the cluster"
@@ -159,7 +155,7 @@ $(KUBECONFIG):
 
 # ── Full end-to-end ───────────────────────────────────────────────────────── #
 
-run: infra-up deploy-local all infra-down
+run: infra-up deploy-local monitoring-extras all infra-down
 
 # ── Individual test targets ───────────────────────────────────────────────── #
 
@@ -267,7 +263,7 @@ bench-env:
 # ── Infrastructure ────────────────────────────────────────────────────────── #
 
 infra-up:
-	$(INFRA_MAKE) provision wait monitoring
+	$(INFRA_MAKE) provision wait monitoring storage monitoring-extras
 	$(MAKE) bench-env
 
 infra-down:
@@ -283,3 +279,13 @@ k0smotron-stable:
 # Build local k0smotron image + deploy (requires infra-up first)
 deploy-local:
 	$(INFRA_MAKE) deploy-local
+
+# Apply postgres + mysql StatefulSets on the tainted storage nodes.
+# Already part of infra-up, but re-runnable on its own.
+storage:
+	$(INFRA_MAKE) storage
+
+# Apply ServiceMonitors for k0s-pushgateway + k0smotron operator. Run after
+# deploy-local / k0smotron-stable so the k0smotron namespace exists.
+monitoring-extras:
+	$(INFRA_MAKE) monitoring-extras
