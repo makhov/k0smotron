@@ -1,3 +1,5 @@
+//go:build bench
+
 /*
 Copyright 2026.
 
@@ -247,7 +249,12 @@ func createClusters(ctx context.Context, kc *kubernetes.Clientset, cfg ScenarioC
 			clusterName := fmt.Sprintf("hcp-%03d", i)
 			start := time.Now()
 
-			if err := createCluster(egCtx, kc, clusterName, cfg.Namespace, cfg); err != nil {
+			clusterCfg, err := applyPerClusterConfig(egCtx, cfg, clusterName, cfg.Namespace)
+			if err != nil {
+				return fmt.Errorf("per-cluster config %s: %w", clusterName, err)
+			}
+
+			if err := createCluster(egCtx, kc, clusterName, cfg.Namespace, clusterCfg); err != nil {
 				// Tolerate AlreadyExists so reruns in the same namespace work.
 				if !apierrors.IsAlreadyExists(err) {
 					return fmt.Errorf("create cluster %s: %w", clusterName, err)

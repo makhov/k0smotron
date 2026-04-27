@@ -18,7 +18,6 @@ package bench
 
 import (
 	"os"
-	"strings"
 	"time"
 
 	km "github.com/k0sproject/k0smotron/api/k0smotron.io/v1beta2"
@@ -56,6 +55,11 @@ type ScenarioConfig struct {
 	Parallelism  int
 	K0sVersion   string
 	Namespace    string
+
+	// StorageNamespace is the namespace where the external storage backend (postgres/mysql)
+	// runs as a pod. Empty for in-namespace backends (etcd, kine-sqlite, kine-nats).
+	// When set, the metrics sampler also polls this namespace and reports db_* columns.
+	StorageNamespace string
 }
 
 // RunResult holds all measured outcomes from one scenario run.
@@ -71,14 +75,32 @@ type RunResult struct {
 	ProvisionP99 time.Duration
 	ProvisionMax time.Duration
 
-	// Steady-state resource usage aggregated across all HCP pods.
-	HCPP50MemMi   int64 // per-pod median memory in MiB
-	HCPP95MemMi   int64 // per-pod p95 memory in MiB
-	HCPTotalMemMi int64 // sum across all HCP pods
-	HCPP50CPUm    int64 // per-pod median CPU in millicores
-	HCPTotalCPUm  int64 // sum across all HCP pods
+	// Peak resource usage aggregated across all HCP pods (kmc-* without -etcd-).
+	// For kine variants, the kine process runs inside the HCP "controller" container
+	// and is naturally folded into these numbers — there is no separate kine pod.
+	HCPP50MemMi   int64 // per-pod median peak memory in MiB
+	HCPP95MemMi   int64 // per-pod p95 peak memory in MiB
+	HCPTotalMemMi int64 // sum of per-pod peaks
+	HCPP50CPUm    int64 // per-pod median peak CPU in millicores
+	HCPTotalCPUm  int64 // sum of per-pod peaks
 
-	// Operator resource usage at steady state.
+	// Etcd backend pods (kmc-*-etcd-N), present only when StorageType=etcd.
+	// Same shape as HCP fields. Zero for kine-* scenarios.
+	EtcdP50MemMi   int64
+	EtcdP95MemMi   int64
+	EtcdTotalMemMi int64
+	EtcdP50CPUm    int64
+	EtcdTotalCPUm  int64
+
+	// External DB pods (postgres / mysql) sampled from cfg.StorageNamespace.
+	// Zero for backends that don't use an external DB.
+	DBP50MemMi   int64
+	DBP95MemMi   int64
+	DBTotalMemMi int64
+	DBP50CPUm    int64
+	DBTotalCPUm  int64
+
+	// Operator peak resource usage across the run.
 	OperatorMemMi int64
 	OperatorCPUm  int64
 
@@ -150,12 +172,13 @@ type PerfResult struct {
 
 // storageEntry bundles a ScenarioConfig partial with an Enabled flag.
 type storageEntry struct {
-	StorageName string
-	Enabled     bool
-	StorageType km.StorageType
-	StorageKine km.KineSpec
-	StorageEtcd km.EtcdSpec
-	StorageNATS km.NATSSpec
+	StorageName      string
+	Enabled          bool
+	StorageType      km.StorageType
+	StorageKine      km.KineSpec
+	StorageEtcd      km.EtcdSpec
+	StorageNATS      km.NATSSpec
+	StorageNamespace string // populated for kine-postgres / kine-mysql; empty otherwise.
 }
 
 func scaleFastProbePatches() []km.ComponentPatch {
@@ -219,12 +242,10 @@ func ensureResourceList(list corev1.ResourceList) corev1.ResourceList {
 }
 
 // storageConfigs returns the full list of storage configurations.
-// Each entry is enabled/disabled by the presence of the required environment variable.
+// Postgres + MySQL run as pods in the bench-storage namespace, reachable via
+// in-cluster Service DNS — see bench/infra/manifests/storage/.
 func storageConfigs(k0sVersion string) []storageEntry {
 	_ = k0sVersion // reserved for future version-specific config adjustments
-
-	postgresURL := os.Getenv("BENCH_POSTGRES_URL")
-	mysqlURL := normalizeMySQLKineURL(os.Getenv("BENCH_MYSQL_URL"))
 
 	return []storageEntry{
 		{
@@ -237,19 +258,21 @@ func storageConfigs(k0sVersion string) []storageEntry {
 		},
 		{
 			StorageName: "kine-postgres",
-			Enabled:     postgresURL != "",
+			Enabled:     true,
 			StorageType: km.StorageTypeKine,
 			StorageKine: km.KineSpec{
-				DataSourceURL: postgresURL,
+				DataSourceURL: "postgres://bench:benchpass@postgres.bench-storage.svc:5432/bench",
 			},
+			StorageNamespace: "bench-storage",
 		},
 		{
 			StorageName: "kine-mysql",
-			Enabled:     mysqlURL != "",
+			Enabled:     true,
 			StorageType: km.StorageTypeKine,
 			StorageKine: km.KineSpec{
-				DataSourceURL: mysqlURL,
+				DataSourceURL: "mysql://bench:benchpass@tcp(mysql.bench-storage.svc:3306)/bench",
 			},
+			StorageNamespace: "bench-storage",
 		},
 		{
 			StorageName: "kine-sqlite",
@@ -264,35 +287,10 @@ func storageConfigs(k0sVersion string) []storageEntry {
 			Enabled:     true,
 			StorageType: km.StorageTypeNATS,
 		},
+		{
+			StorageName: "kine-t4",
+			Enabled:     os.Getenv("BENCH_T4_EMBEDDED_ENABLED") != "0",
+			StorageType: km.StorageTypeKine,
+		},
 	}
-}
-
-func normalizeMySQLKineURL(raw string) string {
-	const prefix = "mysql://"
-	if !strings.HasPrefix(raw, prefix) {
-		return raw
-	}
-
-	rest := strings.TrimPrefix(raw, prefix)
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return raw
-	}
-
-	addrAndSuffix := rest[at+1:]
-	if strings.HasPrefix(addrAndSuffix, "tcp(") {
-		return raw
-	}
-
-	addrEnd := len(addrAndSuffix)
-	for _, sep := range []string{"/", "?"} {
-		if idx := strings.Index(addrAndSuffix, sep); idx >= 0 && idx < addrEnd {
-			addrEnd = idx
-		}
-	}
-	if addrEnd == 0 {
-		return raw
-	}
-
-	return prefix + rest[:at+1] + "tcp(" + addrAndSuffix[:addrEnd] + ")" + addrAndSuffix[addrEnd:]
 }

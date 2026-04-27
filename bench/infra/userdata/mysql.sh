@@ -1,22 +1,39 @@
 #!/bin/bash
-# MySQL 8 node setup
+# MySQL storage node: joins the mgmt k0s cluster as a tainted worker.
+# The actual mysql process runs as a pod scheduled onto this node via
+# nodeSelector db=mysql + toleration for dedicated=mysql:NoSchedule.
+# The io2 data disk is mounted at /var/lib/mysql-data and exposed to the
+# pod via a Local PV.
+#
 # Template variables (injected by Terraform templatefile()):
-#   ${mysql_password} — bench user password
+#   $${k0s_version}
+#   $${cp0_private_ip}
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-BENCH_DB="bench"
-BENCH_USER="bench"
-BENCH_PASSWORD="${mysql_password}"
+K0S_VERSION="${k0s_version}"
+CP0_IP="${cp0_private_ip}"
+TOKEN_PORT=8888
 
-###############################################################################
-# 0. System prerequisites
-###############################################################################
 apt-get update -y
-apt-get install -y curl gnupg
+apt-get install -y curl
+
+cat > /etc/sysctl.d/99-k0smotron-bench.conf <<'EOF'
+fs.file-max = 2097152
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 1048576
+EOF
+sysctl --system
+
+cat > /etc/security/limits.d/99-k0smotron-bench.conf <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
 
 ###############################################################################
-# 1. Wait for the io2 data disk to attach
+# Mount io2 data disk at the path the Local PV expects.
 ###############################################################################
 for i in $(seq 1 20); do
   [ -b /dev/sdb ] || [ -b /dev/nvme1n1 ] && break
@@ -26,83 +43,41 @@ done
 DATA_DEVICE="/dev/sdb"
 [ -b /dev/nvme1n1 ] && DATA_DEVICE="/dev/nvme1n1"
 
-###############################################################################
-# 2. Install MySQL 8
-###############################################################################
-apt-get install -y mysql-server
+if ! blkid "$DATA_DEVICE" > /dev/null 2>&1; then
+  mkfs.ext4 -F "$DATA_DEVICE"
+fi
+
+mkdir -p /var/lib/mysql-data
+DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
+echo "UUID=$DATA_UUID /var/lib/mysql-data ext4 defaults,noatime 0 2" >> /etc/fstab
+mount -a
+
+# MySQL in-container runs as uid 999 (mysql user in official image).
+chown 999:999 /var/lib/mysql-data
+chmod 700 /var/lib/mysql-data
 
 ###############################################################################
-# 3. Configure MySQL
+# Install k0s worker, join cluster, register with taint + label.
 ###############################################################################
-systemctl stop mysql
+curl -sSLf https://get.k0s.sh | K0S_VERSION="$K0S_VERSION" sh
 
-###############################################################################
-# 4. Create / update MySQL config with benchmark tuning
-###############################################################################
-# Prefix with zzz so these settings override the packaged mysqld.cnf defaults.
-cat > /etc/mysql/mysql.conf.d/zzz-bench.cnf << EOF
-[mysqld]
-# Network
-bind-address           = 0.0.0.0
-port                   = 3306
-max_connections        = 500
-max_allowed_packet     = 256M
+echo "Waiting for worker token from $CP0_IP:$TOKEN_PORT..."
+until curl -sf "http://$CP0_IP:$TOKEN_PORT/worker-token" -o /tmp/worker-token; do
+  sleep 5
+done
 
-# InnoDB tuning for benchmark workload
-innodb_buffer_pool_size        = 20G
-innodb_buffer_pool_instances   = 4
-innodb_log_file_size           = 1G
-innodb_log_buffer_size         = 64M
-innodb_flush_log_at_trx_commit = 1
-innodb_flush_method            = O_DIRECT
-innodb_io_capacity             = 5000   # matches io2 IOPS provisioning
-innodb_io_capacity_max         = 5000
-innodb_read_io_threads         = 8
-innodb_write_io_threads        = 8
+k0s install worker \
+  --token-file /tmp/worker-token \
+  --kubelet-extra-args="--register-with-taints=dedicated=mysql:NoSchedule --node-labels=db=mysql"
 
-# Query cache is deprecated in MySQL 8, skip it
-# General
-character-set-server  = utf8mb4
-collation-server      = utf8mb4_unicode_ci
-default_storage_engine = InnoDB
-slow_query_log        = 1
-long_query_time       = 1
+mkdir -p /etc/systemd/system/k0sworker.service.d
+cat > /etc/systemd/system/k0sworker.service.d/limits.conf <<'EOF'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
 EOF
+systemctl daemon-reload
 
-###############################################################################
-# 5. Start MySQL and create bench database + user
-###############################################################################
-systemctl restart mysql
-
-# Wait for MySQL to be ready
-for i in $(seq 1 60); do
-  mysqladmin ping -h 127.0.0.1 --silent && break
-  if [ "$i" -eq 60 ]; then
-    systemctl status mysql --no-pager -l || true
-    journalctl -u mysql --no-pager -n 100 || true
-    exit 1
-  fi
-  sleep 2
-done
-
-PRIVATE_IP=$(hostname -I | awk '{print $1}')
-for i in $(seq 1 30); do
-  timeout 1 bash -c "</dev/tcp/$PRIVATE_IP/3306" >/dev/null 2>&1 && break
-  if [ "$i" -eq 30 ]; then
-    ss -ltnp || true
-    mysqld --verbose --help 2>/dev/null | grep -E '^(bind-address|port)[[:space:]]' || true
-    exit 1
-  fi
-  sleep 2
-done
-
-mysql -u root << SQL
-CREATE DATABASE IF NOT EXISTS \`$BENCH_DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '$BENCH_USER'@'10.0.0.0/255.0.0.0' IDENTIFIED BY '$BENCH_PASSWORD';
-CREATE USER IF NOT EXISTS '$BENCH_USER'@'%' IDENTIFIED BY '$BENCH_PASSWORD';
-GRANT ALL PRIVILEGES ON \`$BENCH_DB\`.* TO '$BENCH_USER'@'10.0.0.0/255.0.0.0';
-GRANT ALL PRIVILEGES ON \`$BENCH_DB\`.* TO '$BENCH_USER'@'%';
-FLUSH PRIVILEGES;
-SQL
-
-echo "MySQL 8 setup complete."
+k0s start
+echo "MySQL storage node joined."

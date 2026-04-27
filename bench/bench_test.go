@@ -45,6 +45,8 @@ var (
 	storageFilter = flag.String("bench.storage", "", "comma-separated storage types to run, empty=all")
 	largeCounts   = flag.Bool("bench.large", false, "include 500-cluster scenario (slow)")
 
+	metricsInterval = flag.Duration("bench.metrics-interval", 10*time.Second, "interval between HCP/operator metrics samples during a scenario")
+
 	globalKC *kubernetes.Clientset
 	globalRC *rest.Config
 )
@@ -119,29 +121,22 @@ func TestScaleMatrix(t *testing.T) {
 				// server and skews measurements.
 
 				cfg := ScenarioConfig{
-					StorageName:  sc.StorageName,
-					StorageType:  sc.StorageType,
-					StorageKine:  sc.StorageKine,
-					StorageEtcd:  sc.StorageEtcd,
-					StorageNATS:  sc.StorageNATS,
-					Patches:      scaleFastProbePatches(),
-					ClusterCount: n,
-					Parallelism:  *parallelism,
-					K0sVersion:   *k0sVersion,
-					Namespace:    fmt.Sprintf("bench-%s-%d", sc.StorageName, n),
+					StorageName:      sc.StorageName,
+					StorageType:      sc.StorageType,
+					StorageKine:      sc.StorageKine,
+					StorageEtcd:      sc.StorageEtcd,
+					StorageNATS:      sc.StorageNATS,
+					StorageNamespace: sc.StorageNamespace,
+					Patches:          scaleFastProbePatches(),
+					ClusterCount:     n,
+					Parallelism:      *parallelism,
+					K0sVersion:       *k0sVersion,
+					Namespace:        fmt.Sprintf("bench-%s-%d", sc.StorageName, n),
 				}
 
-				result, recorded, err := runScenario(t, cfg, reporter.Append)
-				if err != nil {
+				if _, err := runScenario(t, cfg, reporter.Append); err != nil {
 					t.Errorf("scenario %s failed: %v", name, err)
 					return
-				}
-
-				if recorded {
-					return
-				}
-				if err := reporter.Append(result); err != nil {
-					t.Logf("warning: failed to write result row: %v", err)
 				}
 			})
 		}
@@ -149,10 +144,9 @@ func TestScaleMatrix(t *testing.T) {
 }
 
 // runScenario executes the full benchmark scenario for one (storage, count) combination.
-func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunResult, bool, error) {
+func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunResult, error) {
 	t.Helper()
 	ctx := context.Background()
-	recorded := false
 
 	result := RunResult{
 		Timestamp:    time.Now().UTC(),
@@ -161,10 +155,22 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 		Parallelism:  cfg.Parallelism,
 	}
 
+	// Always record whatever we have on the way out — covers normal return,
+	// error return, panic, and t.FailNow/Goexit. result is captured by reference
+	// so churn fields populated below are included.
+	defer func() {
+		if record == nil {
+			return
+		}
+		if err := record(result); err != nil {
+			t.Logf("warning: failed to write result row: %v", err)
+		}
+	}()
+
 	// 1. Create namespace (idempotent).
 	t.Logf("creating namespace %q", cfg.Namespace)
 	if err := ensureNamespace(ctx, globalKC, cfg.Namespace); err != nil {
-		return result, recorded, fmt.Errorf("ensure namespace: %w", err)
+		return result, fmt.Errorf("ensure namespace: %w", err)
 	}
 	defer func() {
 		t.Logf("cleaning up namespace %q", cfg.Namespace)
@@ -175,11 +181,27 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 		}
 	}()
 
-	// 2 & 3 & 4. Parallel-create N clusters, record timings, wait for ready.
+	// 2. Start periodic metrics sampler. Runs through provision, steady-state, and
+	// churn so peak load is captured rather than the post-idle snapshot.
+	var sampler *metricsSampler
+	mc, err := newMetricsClient(globalRC)
+	if err != nil {
+		t.Logf("warning: cannot build metrics client, skipping resource metrics: %v", err)
+	} else {
+		sampler = newMetricsSampler(mc, cfg.Namespace, cfg.StorageNamespace, *metricsInterval)
+		sampleCtx, cancelSampler := context.WithCancel(ctx)
+		go sampler.Run(sampleCtx)
+		defer func() {
+			cancelSampler()
+			sampler.Wait()
+		}()
+	}
+
+	// 3 & 4 & 5. Parallel-create N clusters, record timings, wait for ready.
 	t.Logf("creating %d clusters with parallelism %d", cfg.ClusterCount, cfg.Parallelism)
 	timings, err := createClusters(ctx, globalKC, cfg)
 	if err != nil {
-		return result, recorded, fmt.Errorf("create clusters: %w", err)
+		return result, fmt.Errorf("create clusters: %w", err)
 	}
 
 	provDurations := make([]time.Duration, 0, len(timings))
@@ -190,51 +212,13 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 	t.Logf("provisioning p50=%s p95=%s p99=%s max=%s",
 		result.ProvisionP50, result.ProvisionP95, result.ProvisionP99, result.ProvisionMax)
 
-	// 5. Steady-state window.
+	// 6. Steady-state window. Sampler keeps ticking through this so we still
+	// pick up settled-load mem/cpu.
 	t.Log("entering 30s steady-state window")
 	select {
 	case <-ctx.Done():
-		return result, recorded, ctx.Err()
+		return result, ctx.Err()
 	case <-time.After(30 * time.Second):
-	}
-
-	// 6. Collect metrics.
-	mc, err := newMetricsClient(globalRC)
-	if err != nil {
-		t.Logf("warning: cannot build metrics client, skipping resource metrics: %v", err)
-	} else {
-		hcpSamples, err := collectHCPMetrics(ctx, mc, globalKC, cfg.Namespace)
-		if err != nil {
-			t.Logf("warning: HCP metrics unavailable: %v", err)
-		} else {
-			cpuVals := make([]int64, 0, len(hcpSamples))
-			memVals := make([]int64, 0, len(hcpSamples))
-			for _, s := range hcpSamples {
-				cpuVals = append(cpuVals, s.CPUMillis)
-				memVals = append(memVals, s.MemoryMiB)
-				result.HCPTotalCPUm += s.CPUMillis
-				result.HCPTotalMemMi += s.MemoryMiB
-			}
-			result.HCPP50CPUm, _ = int64Percentiles(cpuVals)
-			result.HCPP50MemMi, result.HCPP95MemMi = int64Percentiles(memVals)
-		}
-
-		opSample, err := collectOperatorMetrics(ctx, mc)
-		if err != nil {
-			t.Logf("warning: operator metrics unavailable: %v", err)
-		} else {
-			result.OperatorCPUm = opSample.CPUMillis
-			result.OperatorMemMi = opSample.MemoryMiB
-		}
-	}
-
-	if record != nil {
-		if err := record(result); err != nil {
-			t.Logf("warning: failed to write result row before churn and cleanup: %v", err)
-		} else {
-			recorded = true
-			t.Logf("wrote result row for %s/%d before churn and cleanup", cfg.StorageName, cfg.ClusterCount)
-		}
 	}
 
 	// 7. Churn: delete 10% of clusters, recreate, measure recovery.
@@ -251,13 +235,41 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 		t.Logf("churn recovery p50=%s p95=%s", result.ChurnRecoveryP50, result.ChurnRecoveryP95)
 	}
 
+	// Aggregate sampled metrics into the result. Sampler is still running; reading
+	// its peaks now yields what was seen across provision + steady-state + churn.
+	if sampler != nil {
+		agg := sampler.Aggregate()
+		result.HCPP50CPUm = agg.HCP.P50CPUm
+		result.HCPP50MemMi = agg.HCP.P50MemMi
+		result.HCPP95MemMi = agg.HCP.P95MemMi
+		result.HCPTotalCPUm = agg.HCP.TotalCPUm
+		result.HCPTotalMemMi = agg.HCP.TotalMemMi
+		result.EtcdP50CPUm = agg.Etcd.P50CPUm
+		result.EtcdP50MemMi = agg.Etcd.P50MemMi
+		result.EtcdP95MemMi = agg.Etcd.P95MemMi
+		result.EtcdTotalCPUm = agg.Etcd.TotalCPUm
+		result.EtcdTotalMemMi = agg.Etcd.TotalMemMi
+		result.DBP50CPUm = agg.DB.P50CPUm
+		result.DBP50MemMi = agg.DB.P50MemMi
+		result.DBP95MemMi = agg.DB.P95MemMi
+		result.DBTotalCPUm = agg.DB.TotalCPUm
+		result.DBTotalMemMi = agg.DB.TotalMemMi
+		result.OperatorCPUm = agg.OperatorCPUm
+		result.OperatorMemMi = agg.OperatorMemMi
+		t.Logf("metrics: hcp=%dpods/%dsamples etcd=%dpods/%dsamples db=%dpods/%dsamples operator=%dsamples",
+			agg.HCP.PodCount, agg.HCP.Samples,
+			agg.Etcd.PodCount, agg.Etcd.Samples,
+			agg.DB.PodCount, agg.DB.Samples,
+			agg.OperatorSamples)
+	}
+
 	// 8. Delete all clusters.
 	t.Logf("deleting all clusters in namespace %q", cfg.Namespace)
 	if err := deleteAllClusters(ctx, globalKC, cfg.Namespace); err != nil {
 		t.Logf("warning: failed to delete all clusters: %v", err)
 	}
 
-	return result, recorded, nil
+	return result, nil
 }
 
 // runChurn deletes churnCount random clusters, recreates them, and returns recovery durations.
@@ -323,8 +335,14 @@ func runChurn(
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			clusterCfg, err := applyPerClusterConfig(recCtx, cfg, v.Name, cfg.Namespace)
+			if err != nil {
+				results[i] = churnResult{err: fmt.Errorf("per-cluster config: %w", err)}
+				return nil
+			}
+
 			start := time.Now()
-			if err := createCluster(recCtx, globalKC, v.Name, cfg.Namespace, cfg); err != nil {
+			if err := createCluster(recCtx, globalKC, v.Name, cfg.Namespace, clusterCfg); err != nil {
 				results[i] = churnResult{err: err}
 				return nil // report but don't abort
 			}

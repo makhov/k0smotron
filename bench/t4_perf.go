@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	km "github.com/k0sproject/k0smotron/api/k0smotron.io/v1beta2"
@@ -53,13 +54,6 @@ const (
 func perfStorageConfigs(k0sVersion string) []storageEntry {
 	configs := append([]storageEntry{}, storageConfigs(k0sVersion)...)
 
-	if os.Getenv("BENCH_T4_EMBEDDED_ENABLED") != "0" {
-		configs = append(configs, storageEntry{
-			StorageName: "kine-t4",
-			Enabled:     true,
-			StorageType: km.StorageTypeKine,
-		})
-	}
 	if os.Getenv("BENCH_T4_STANDALONE_ENABLED") != "0" {
 		configs = append(configs, storageEntry{
 			StorageName: "t4-standalone",
@@ -69,6 +63,20 @@ func perfStorageConfigs(k0sVersion string) []storageEntry {
 	}
 
 	return configs
+}
+
+// applyPerClusterConfig finishes scenario configuration that depends on the
+// individual cluster name. Called once per cluster from createClusters and
+// the churn recreate path so each HCP gets its own headless service, S3
+// bucket, and storage URL when running with a per-cluster backend like
+// kine-t4. No-op for backends whose config is identical across clusters.
+func applyPerClusterConfig(ctx context.Context, cfg ScenarioConfig, clusterName, namespace string) (ScenarioConfig, error) {
+	switch cfg.StorageName {
+	case "kine-t4":
+		return configureEmbeddedT4Scenario(ctx, cfg, clusterName, namespace)
+	default:
+		return cfg, nil
+	}
 }
 
 func configurePerfScenario(ctx context.Context, sc storageEntry, clusterName, namespace string, nodeAddrs []string, replicas int32, k0sVersion string) (ScenarioConfig, error) {
@@ -120,15 +128,14 @@ func configureEmbeddedT4Scenario(ctx context.Context, cfg ScenarioConfig, cluste
 			endpoint,
 		),
 	}
-	cfg.Patches = []km.ComponentPatch{
-		{
-			Target: km.PatchTarget{
-				Kind:      "StatefulSet",
-				Component: "control-plane",
-			},
-			Patch: km.PatchSpec{
-				Type: km.StrategicMergePatchType,
-				Content: fmt.Sprintf(`spec:
+	cfg.Patches = append(cfg.Patches, km.ComponentPatch{
+		Target: km.PatchTarget{
+			Kind:      "StatefulSet",
+			Component: "control-plane",
+		},
+		Patch: km.PatchSpec{
+			Type: km.StrategicMergePatchType,
+			Content: fmt.Sprintf(`spec:
   podManagementPolicy: Parallel
   serviceName: %s
   template:
@@ -151,9 +158,8 @@ func configureEmbeddedT4Scenario(ctx context.Context, cfg ScenarioConfig, cluste
             - name: T4_S3_SECRET_ACCESS_KEY
               value: %q
 `, headlessServiceName, t4BusyboxImage, headlessServiceName, namespace, accessKey, secretKey),
-			},
 		},
-	}
+	})
 	return cfg, nil
 }
 
@@ -283,30 +289,23 @@ func ensureT4HeadlessService(ctx context.Context, namespace, clusterName, servic
 	return nil
 }
 
+var (
+	t4MinIOInfraOnce sync.Once
+	t4MinIOInfraErr  error
+)
+
 func ensureT4MinIO(ctx context.Context, bucket string) (endpoint, accessKey, secretKey string, err error) {
-	endpoint = strings.TrimSpace(os.Getenv("BENCH_T4_S3_ENDPOINT"))
 	accessKey = envOrDefault("BENCH_T4_S3_ACCESS_KEY_ID", t4DefaultAccessKey)
 	secretKey = envOrDefault("BENCH_T4_S3_SECRET_ACCESS_KEY", t4DefaultSecretKey)
 	if bucket == "" {
 		bucket = envOrDefault("BENCH_T4_S3_BUCKET", t4DefaultBucket)
 	}
-	if endpoint != "" {
-		return endpoint, accessKey, secretKey, nil
+
+	if external := strings.TrimSpace(os.Getenv("BENCH_T4_S3_ENDPOINT")); external != "" {
+		return external, accessKey, secretKey, nil
 	}
 
-	if err := ensureNamespace(ctx, globalKC, t4MinIONamespace); err != nil {
-		return "", "", "", fmt.Errorf("ensure t4 namespace: %w", err)
-	}
-	if err := ensureT4MinIOSecret(ctx, accessKey, secretKey); err != nil {
-		return "", "", "", err
-	}
-	if err := ensureT4MinIOService(ctx); err != nil {
-		return "", "", "", err
-	}
-	if err := ensureT4MinIODeployment(ctx); err != nil {
-		return "", "", "", err
-	}
-	if err := waitDeploymentReady(ctx, t4MinIONamespace, t4MinIOServiceName, 5*time.Minute); err != nil {
+	if err := ensureT4MinIOInfra(ctx, accessKey, secretKey); err != nil {
 		return "", "", "", err
 	}
 	if err := ensureT4Bucket(ctx, accessKey, secretKey, bucket); err != nil {
@@ -314,6 +313,32 @@ func ensureT4MinIO(ctx context.Context, bucket string) (endpoint, accessKey, sec
 	}
 
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:9000", t4MinIOServiceName, t4MinIONamespace), accessKey, secretKey, nil
+}
+
+// ensureT4MinIOInfra brings up the shared MinIO namespace, secret, service,
+// and deployment exactly once per process. Per-cluster bucket creation runs
+// outside the once-guard so distinct buckets can be created in parallel.
+func ensureT4MinIOInfra(ctx context.Context, accessKey, secretKey string) error {
+	t4MinIOInfraOnce.Do(func() {
+		if err := ensureNamespace(ctx, globalKC, t4MinIONamespace); err != nil {
+			t4MinIOInfraErr = fmt.Errorf("ensure t4 namespace: %w", err)
+			return
+		}
+		if err := ensureT4MinIOSecret(ctx, accessKey, secretKey); err != nil {
+			t4MinIOInfraErr = err
+			return
+		}
+		if err := ensureT4MinIOService(ctx); err != nil {
+			t4MinIOInfraErr = err
+			return
+		}
+		if err := ensureT4MinIODeployment(ctx); err != nil {
+			t4MinIOInfraErr = err
+			return
+		}
+		t4MinIOInfraErr = waitDeploymentReady(ctx, t4MinIONamespace, t4MinIOServiceName, 5*time.Minute)
+	})
+	return t4MinIOInfraErr
 }
 
 func ensureT4MinIOSecret(ctx context.Context, accessKey, secretKey string) error {

@@ -1,22 +1,40 @@
 #!/bin/bash
-# PostgreSQL 16 node setup
+# Postgres storage node: joins the mgmt k0s cluster as a tainted worker.
+# The actual postgres process runs as a pod scheduled onto this node via
+# nodeSelector db=postgres + toleration for dedicated=postgres:NoSchedule.
+# The io2 data disk is mounted at /var/lib/postgres-data and exposed to the
+# pod via a Local PV.
+#
 # Template variables (injected by Terraform templatefile()):
-#   ${postgres_password} — bench user password
+#   $${k0s_version}
+#   $${cp0_private_ip}
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-BENCH_DB="bench"
-BENCH_USER="bench"
-BENCH_PASSWORD="${postgres_password}"
+K0S_VERSION="${k0s_version}"
+CP0_IP="${cp0_private_ip}"
+TOKEN_PORT=8888
 
-###############################################################################
-# 0. System prerequisites
-###############################################################################
 apt-get update -y
-apt-get install -y curl gnupg lsb-release
+apt-get install -y curl
+
+# Kernel/limits tuning matches workers — kine + postgres open many connections.
+cat > /etc/sysctl.d/99-k0smotron-bench.conf <<'EOF'
+fs.file-max = 2097152
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 1048576
+EOF
+sysctl --system
+
+cat > /etc/security/limits.d/99-k0smotron-bench.conf <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
 
 ###############################################################################
-# 1. Mount io2 data disk at PostgreSQL's default data root
+# Mount io2 data disk at the path the Local PV expects.
 ###############################################################################
 for i in $(seq 1 20); do
   [ -b /dev/sdb ] || [ -b /dev/nvme1n1 ] && break
@@ -30,72 +48,37 @@ if ! blkid "$DATA_DEVICE" > /dev/null 2>&1; then
   mkfs.ext4 -F "$DATA_DEVICE"
 fi
 
-mkdir -p /var/lib/postgresql
+mkdir -p /var/lib/postgres-data
 DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
-echo "UUID=$DATA_UUID /var/lib/postgresql ext4 defaults,noatime 0 2" >> /etc/fstab
+echo "UUID=$DATA_UUID /var/lib/postgres-data ext4 defaults,noatime 0 2" >> /etc/fstab
 mount -a
 
-###############################################################################
-# 2. Install PostgreSQL 16
-###############################################################################
-curl -sSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor \
-  -o /usr/share/keyrings/postgresql-archive-keyring.gpg
-
-echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] \
-  https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-  > /etc/apt/sources.list.d/pgdg.list
-
-apt-get update -y
-apt-get install -y postgresql-16
-systemctl stop postgresql
-chown -R postgres:postgres /var/lib/postgresql
+# Postgres in-container runs as uid 999 (postgres user in official image).
+chown 999:999 /var/lib/postgres-data
+chmod 700 /var/lib/postgres-data
 
 ###############################################################################
-# 3. Configure PostgreSQL
+# Install k0s worker, join cluster, register with taint + label.
 ###############################################################################
-PG_CONF="/etc/postgresql/16/main/postgresql.conf"
+curl -sSLf https://get.k0s.sh | K0S_VERSION="$K0S_VERSION" sh
 
-###############################################################################
-# 4. Tune postgresql.conf for benchmark workload
-###############################################################################
-cat >> "$PG_CONF" << 'EOF'
+echo "Waiting for worker token from $CP0_IP:$TOKEN_PORT..."
+until curl -sf "http://$CP0_IP:$TOKEN_PORT/worker-token" -o /tmp/worker-token; do
+  sleep 5
+done
 
-# k0smotron benchmark tuning
-max_connections            = 500
-shared_buffers             = 8GB
-effective_cache_size       = 24GB
-maintenance_work_mem       = 512MB
-work_mem                   = 16MB
-wal_buffers                = 64MB
-checkpoint_completion_target = 0.9
-default_statistics_target  = 100
-random_page_cost           = 1.1  # io2 — treat as near-SSD random cost
-effective_io_concurrency   = 200
-max_wal_size               = 4GB
-min_wal_size               = 1GB
-synchronous_commit         = on
-log_min_duration_statement = 1000
+k0s install worker \
+  --token-file /tmp/worker-token \
+  --kubelet-extra-args="--register-with-taints=dedicated=postgres:NoSchedule --node-labels=db=postgres"
+
+mkdir -p /etc/systemd/system/k0sworker.service.d
+cat > /etc/systemd/system/k0sworker.service.d/limits.conf <<'EOF'
+[Service]
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
 EOF
+systemctl daemon-reload
 
-###############################################################################
-# 5. Allow connections from the benchmark VPC (10.0.0.0/8)
-###############################################################################
-PG_HBA="/etc/postgresql/16/main/pg_hba.conf"
-echo "host    all    all    10.0.0.0/8    scram-sha-256" >> "$PG_HBA"
-
-# Listen on all interfaces
-sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" "$PG_CONF"
-
-###############################################################################
-# 6. Start PostgreSQL and create bench database + user
-###############################################################################
-systemctl start postgresql
-
-# Wait for PostgreSQL to accept connections
-until pg_isready -h 127.0.0.1 -p 5432; do sleep 2; done
-
-sudo -u postgres psql -c "CREATE USER $BENCH_USER WITH PASSWORD '$BENCH_PASSWORD';"
-sudo -u postgres psql -c "CREATE DATABASE $BENCH_DB OWNER $BENCH_USER;"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $BENCH_DB TO $BENCH_USER;"
-
-echo "PostgreSQL 16 setup complete."
+k0s start
+echo "Postgres storage node joined."

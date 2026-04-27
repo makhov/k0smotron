@@ -119,35 +119,3 @@ resource "aws_security_group" "external" {
   tags = { Name = "k0smotron-bench-external" }
 }
 
-# sg_storage — storage service ports, accessible only from sg_internal members
-resource "aws_security_group" "storage" {
-  name        = "k0smotron-bench-storage"
-  description = "Allow PostgreSQL (5432), MySQL (3306) from sg_internal only"
-  vpc_id      = aws_vpc.bench.id
-
-  ingress {
-    description     = "PostgreSQL"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.internal.id]
-  }
-
-  ingress {
-    description     = "MySQL"
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    security_groups = [aws_security_group.internal.id]
-  }
-
-  egress {
-    description = "Allow all outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "k0smotron-bench-storage" }
-}

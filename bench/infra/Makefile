@@ -61,7 +61,7 @@ SCP           = scp $(SSH_OPTS)
 # Targets
 # --------------------------------------------------------------------------- #
 
-.PHONY: help all provision wait monitoring k0smotron-stable worker-limits bench \
+.PHONY: help all provision wait monitoring storage k0smotron-stable worker-limits bench \
         prom-snapshot destroy image manifests deploy-local
 
 help:
@@ -71,6 +71,7 @@ help:
 	@echo "  provision     terraform apply (requires KEY=<ec2-key-pair>)"
 	@echo "  wait          wait for observer cloud-init to complete"
 	@echo "  monitoring        install cert-manager + metrics-server + Prometheus"
+	@echo "  storage           apply postgres + mysql StatefulSets on the tainted storage nodes"
 	@echo "  k0smotron-stable  install stable k0smotron from docs.k0smotron.io"
 	@echo "  worker-limits     raise worker node file-descriptor limits and restart k0s workers"
 	@echo "  deploy-local      build + push local k0smotron image + apply local install.yaml"
@@ -81,7 +82,7 @@ help:
 	@echo "Override vars: KEY CIDR SSH_KEY LOCAL_IMG BENCH_TIMEOUT BENCH_PARALLEL"
 	@echo "               BENCH_K0S_VER BENCH_STORAGE BENCH_LARGE"
 
-all: provision wait monitoring k0smotron-stable bench
+all: provision wait monitoring storage k0smotron-stable bench
 
 # --------------------------------------------------------------------------- #
 
@@ -118,14 +119,17 @@ wait:
 	done; \
 	echo "Observer ready.                                    "; \
 	echo "SSH: ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP"; \
-	POSTGRES_IP=$$(terraform output -raw postgres_ip); \
-	MYSQL_IP=$$(terraform output -raw mysql_ip); \
-	test -n "$$POSTGRES_IP" && test -n "$$MYSQL_IP" || { echo "ERROR: storage terraform outputs empty"; exit 1; }; \
-	echo "Waiting for PostgreSQL on $$POSTGRES_IP:5432 (up to $(SSH_TIMEOUT)s)..."; \
-	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP "elapsed=0; until timeout 1 bash -c '</dev/tcp/$$POSTGRES_IP/5432' >/dev/null 2>&1; do elapsed=\$$((elapsed + 2)); if [ \$$elapsed -ge $(SSH_TIMEOUT) ]; then echo 'ERROR: timed out waiting for PostgreSQL'; exit 1; fi; sleep 2; done"; \
-	echo "Waiting for MySQL on $$MYSQL_IP:3306 (up to $(SSH_TIMEOUT)s)..."; \
-	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP "elapsed=0; until timeout 1 bash -c '</dev/tcp/$$MYSQL_IP/3306' >/dev/null 2>&1; do elapsed=\$$((elapsed + 2)); if [ \$$elapsed -ge $(SSH_TIMEOUT) ]; then echo 'ERROR: timed out waiting for MySQL'; exit 1; fi; sleep 2; done"; \
-	echo "Storage backends are accepting TCP connections."
+	echo "Waiting for postgres + mysql storage nodes to join the k0s cluster..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP "elapsed=0; \
+	  while : ; do \
+	    PG_READY=\$$(kubectl get nodes -l db=postgres -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null); \
+	    MY_READY=\$$(kubectl get nodes -l db=mysql    -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null); \
+	    [ \"\$$PG_READY\" = True ] && [ \"\$$MY_READY\" = True ] && break; \
+	    elapsed=\$$((elapsed + 5)); \
+	    if [ \$$elapsed -ge $(SSH_TIMEOUT) ]; then echo 'ERROR: timed out waiting for storage nodes'; kubectl get nodes -L db; exit 1; fi; \
+	    sleep 5; \
+	  done"; \
+	echo "Storage nodes joined and Ready."
 
 # --------------------------------------------------------------------------- #
 
@@ -170,6 +174,22 @@ monitoring:
 	    --set prometheus.prometheusSpec.enableAdminAPI=true \
 	    --wait --timeout 10m'; \
 	echo "Cluster support stack ready. Deploy k0smotron via: make k0smotron-stable OR make deploy-local"
+
+# Apply storage backend manifests (postgres + mysql StatefulSets on the
+# tainted db=postgres / db=mysql nodes provisioned by terraform).
+# We scp the local manifests directory so the observer always uses the
+# version checked out locally — its own clone of the repo is shallow main.
+storage:
+	@OBSERVER_IP=$$(cd $(TF_DIR) && terraform output -raw observer_ip); \
+	test -n "$$OBSERVER_IP" || { echo "ERROR: observer_ip empty"; exit 1; }; \
+	echo "Copying storage manifests to $$OBSERVER_IP..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'rm -rf ~/storage-manifests && mkdir -p ~/storage-manifests'; \
+	scp $(SSH_OPTS) -r $(TF_DIR)manifests/storage/. ubuntu@$$OBSERVER_IP:~/storage-manifests/; \
+	echo "Applying..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'kubectl apply -k ~/storage-manifests; \
+	  kubectl -n bench-storage rollout status statefulset/postgres --timeout=10m; \
+	  kubectl -n bench-storage rollout status statefulset/mysql    --timeout=10m; \
+	  kubectl -n bench-storage get pods,pvc'
 
 # Install stable k0smotron from docs.k0smotron.io
 k0smotron-stable:

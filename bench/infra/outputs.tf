@@ -17,26 +17,25 @@ output "observer_ip" {
   value       = aws_instance.observer.public_ip
 }
 
-output "postgres_ip" {
-  description = "Private IP of the PostgreSQL node (accessible only within the VPC)"
+output "postgres_node_ip" {
+  description = "Private IP of the postgres storage node (joined as a tainted k0s worker)"
   value       = aws_instance.postgres.private_ip
 }
 
-output "mysql_ip" {
-  description = "Private IP of the MySQL node (accessible only within the VPC)"
+output "mysql_node_ip" {
+  description = "Private IP of the mysql storage node (joined as a tainted k0s worker)"
   value       = aws_instance.mysql.private_ip
 }
 
 output "bench_env" {
   description = "Export these environment variables on the observer node before running benchmarks"
-  sensitive   = true
   value       = <<-EOT
-    # Run these on the observer node (or wherever you execute the benchmark binary)
+    # Run these on the observer node (or wherever you execute the benchmark binary).
+    # Postgres + mysql backends run as pods in the mgmt cluster (see manifests/storage)
+    # and the bench code reaches them via hardcoded in-cluster Service DNS — no
+    # BENCH_POSTGRES_URL / BENCH_MYSQL_URL needed.
 
     export KUBECONFIG=/home/ubuntu/.kube/config   # populated by observer.sh
-
-    export BENCH_POSTGRES_URL="postgres://bench:${var.postgres_password}@${aws_instance.postgres.private_ip}:5432/bench"
-    export BENCH_MYSQL_URL="mysql://bench:${var.mysql_password}@tcp(${aws_instance.mysql.private_ip}:3306)/bench"
     export BENCH_WORKER_EXTERNAL_ADDRESSES="${join(",", aws_instance.worker[*].public_ip)}"
   EOT
 }

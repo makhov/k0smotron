@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,6 +102,183 @@ func collectOperatorMetrics(ctx context.Context, mc *metricsClient) (PodMetricSa
 		}
 	}
 	return PodMetricSample{}, fmt.Errorf("operator pod not found in namespace %s", operatorNS)
+}
+
+// podPeak is an online accumulator: peak CPU/mem observed for one pod across the run.
+type podPeak struct {
+	cpuMillis int64
+	memMiB    int64
+	samples   int
+}
+
+func (p *podPeak) observe(s PodMetricSample) {
+	if s.CPUMillis > p.cpuMillis {
+		p.cpuMillis = s.CPUMillis
+	}
+	if s.MemoryMiB > p.memMiB {
+		p.memMiB = s.MemoryMiB
+	}
+	p.samples++
+}
+
+// metricsSampler periodically polls metrics.k8s.io for HCP, etcd, external DB,
+// and operator pods. Pods in the HCP namespace are split into HCP vs etcd by
+// pod-name pattern (etcd StatefulSet pods are named kmc-<cluster>-etcd-<n>).
+// Pods in storageNS (when set) are bucketed under db.
+type metricsSampler struct {
+	mc        *metricsClient
+	hcpNS     string
+	storageNS string // empty if no external DB for this scenario
+	interval  time.Duration
+
+	mu       sync.Mutex
+	hcp      map[string]*podPeak
+	etcd     map[string]*podPeak
+	db       map[string]*podPeak
+	operator podPeak
+
+	done chan struct{}
+}
+
+// bucketStats holds the aggregated p50/p95/total for one pod-bucket.
+type bucketStats struct {
+	P50CPUm    int64
+	P50MemMi   int64
+	P95MemMi   int64
+	TotalCPUm  int64
+	TotalMemMi int64
+	PodCount   int
+	Samples    int
+}
+
+// metricsAggregate is the final summary produced by metricsSampler.Aggregate.
+type metricsAggregate struct {
+	HCP             bucketStats
+	Etcd            bucketStats
+	DB              bucketStats
+	OperatorCPUm    int64
+	OperatorMemMi   int64
+	OperatorSamples int
+}
+
+// classifyHCPPod returns true when the pod belongs to the etcd StatefulSet
+// (kmc-<cluster>-etcd-<n>). Other pods in the HCP namespace are HCP pods.
+func classifyHCPPod(podName string) (isEtcd bool) {
+	return strings.Contains(podName, "-etcd-")
+}
+
+func newMetricsSampler(mc *metricsClient, hcpNS, storageNS string, interval time.Duration) *metricsSampler {
+	return &metricsSampler{
+		mc:        mc,
+		hcpNS:     hcpNS,
+		storageNS: storageNS,
+		interval:  interval,
+		hcp:       make(map[string]*podPeak),
+		etcd:      make(map[string]*podPeak),
+		db:        make(map[string]*podPeak),
+		done:      make(chan struct{}),
+	}
+}
+
+// Run blocks sampling until ctx is canceled. Caller spawns it in a goroutine
+// and waits for completion via Wait after canceling.
+func (s *metricsSampler) Run(ctx context.Context) {
+	defer close(s.done)
+	t := time.NewTicker(s.interval)
+	defer t.Stop()
+
+	s.sampleOnce(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.sampleOnce(ctx)
+		}
+	}
+}
+
+// observeInto picks the right bucket map and records the peak.
+func (s *metricsSampler) observeInto(bucket map[string]*podPeak, p PodMetricSample) {
+	ser, ok := bucket[p.PodName]
+	if !ok {
+		ser = &podPeak{}
+		bucket[p.PodName] = ser
+	}
+	ser.observe(p)
+}
+
+func (s *metricsSampler) sampleOnce(ctx context.Context) {
+	if hcp, err := collectHCPMetrics(ctx, s.mc, nil, s.hcpNS); err == nil {
+		s.mu.Lock()
+		for _, p := range hcp {
+			if classifyHCPPod(p.PodName) {
+				s.observeInto(s.etcd, p)
+			} else {
+				s.observeInto(s.hcp, p)
+			}
+		}
+		s.mu.Unlock()
+	}
+	if s.storageNS != "" {
+		if dbs, err := collectHCPMetrics(ctx, s.mc, nil, s.storageNS); err == nil {
+			s.mu.Lock()
+			for _, p := range dbs {
+				s.observeInto(s.db, p)
+			}
+			s.mu.Unlock()
+		}
+	}
+	if op, err := collectOperatorMetrics(ctx, s.mc); err == nil {
+		s.mu.Lock()
+		s.operator.observe(op)
+		s.mu.Unlock()
+	}
+}
+
+// Wait blocks until Run has returned. Cancel the context first.
+func (s *metricsSampler) Wait() { <-s.done }
+
+// summarize collapses one pod-bucket into bucketStats.
+func summarize(bucket map[string]*podPeak) bucketStats {
+	cpu := make([]int64, 0, len(bucket))
+	mem := make([]int64, 0, len(bucket))
+	var totalCPU, totalMem int64
+	var samples int
+	for _, p := range bucket {
+		cpu = append(cpu, p.cpuMillis)
+		mem = append(mem, p.memMiB)
+		totalCPU += p.cpuMillis
+		totalMem += p.memMiB
+		samples += p.samples
+	}
+	p50CPU, _ := int64Percentiles(cpu)
+	p50Mem, p95Mem := int64Percentiles(mem)
+	return bucketStats{
+		P50CPUm:    p50CPU,
+		P50MemMi:   p50Mem,
+		P95MemMi:   p95Mem,
+		TotalCPUm:  totalCPU,
+		TotalMemMi: totalMem,
+		PodCount:   len(bucket),
+		Samples:    samples,
+	}
+}
+
+// Aggregate freezes the current state and returns the summary. Safe to call
+// after Wait; safe to call mid-flight (caller takes a snapshot view).
+func (s *metricsSampler) Aggregate() metricsAggregate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return metricsAggregate{
+		HCP:             summarize(s.hcp),
+		Etcd:            summarize(s.etcd),
+		DB:              summarize(s.db),
+		OperatorCPUm:    s.operator.cpuMillis,
+		OperatorMemMi:   s.operator.memMiB,
+		OperatorSamples: s.operator.samples,
+	}
 }
 
 // parsePodMetricsList decodes a raw metrics.k8s.io PodMetricsList response.

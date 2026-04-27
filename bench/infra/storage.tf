@@ -23,11 +23,12 @@ resource "aws_instance" "postgres" {
 
   vpc_security_group_ids = [
     aws_security_group.internal.id,
-    aws_security_group.storage.id,
+    aws_security_group.external.id,
   ]
 
   user_data = base64encode(templatefile("${path.module}/userdata/postgres.sh", {
-    postgres_password = var.postgres_password
+    k0s_version    = var.k0s_version
+    cp0_private_ip = aws_instance.cp_primary.private_ip
   }))
   user_data_replace_on_change = true
 
@@ -80,11 +81,12 @@ resource "aws_instance" "mysql" {
 
   vpc_security_group_ids = [
     aws_security_group.internal.id,
-    aws_security_group.storage.id,
+    aws_security_group.external.id,
   ]
 
   user_data = base64encode(templatefile("${path.module}/userdata/mysql.sh", {
-    mysql_password = var.mysql_password
+    k0s_version    = var.k0s_version
+    cp0_private_ip = aws_instance.cp_primary.private_ip
   }))
   user_data_replace_on_change = true
 

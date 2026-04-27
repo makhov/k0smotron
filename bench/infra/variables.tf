@@ -27,20 +27,6 @@ variable "k0s_version" {
   default     = "v1.31.2+k0s.0"
 }
 
-variable "postgres_password" {
-  description = "Password for the PostgreSQL bench user"
-  type        = string
-  default     = "bench_secret_change_me"
-  sensitive   = true
-}
-
-variable "mysql_password" {
-  description = "Password for the MySQL bench user"
-  type        = string
-  default     = "bench_secret_change_me"
-  sensitive   = true
-}
-
 variable "cp_instance_type" {
   description = "EC2 instance type for the k0s control-plane"
   type        = string
