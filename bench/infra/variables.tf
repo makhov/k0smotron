@@ -24,7 +24,7 @@ variable "allowed_cidr" {
 variable "k0s_version" {
   description = "k0s version to install on management cluster nodes"
   type        = string
-  default     = "v1.31.2+k0s.0"
+  default     = "v1.35.3+k0s.0"
 }
 
 variable "cp_instance_type" {

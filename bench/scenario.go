@@ -55,6 +55,9 @@ type ScenarioConfig struct {
 	Parallelism  int
 	K0sVersion   string
 	Namespace    string
+	// RunID is the repeat index when each (storage, count) tuple is executed
+	// more than once for variance smoothing. Propagated into RunResult.
+	RunID int
 
 	// StorageNamespace is the namespace where the storage backend runs as a
 	// pod (postgres/mysql Deployments). Empty for in-namespace backends like
@@ -69,6 +72,10 @@ type RunResult struct {
 	StorageName  string
 	ClusterCount int
 	Parallelism  int
+	// RunID identifies the repeat index (1..N) when each scenario is run more
+	// than once for variance smoothing. Aggregation typically takes the median
+	// across run_id per (storage_name, cluster_count) tuple.
+	RunID int
 
 	// Provisioning latency percentiles across all clusters in the scenario.
 	ProvisionP50 time.Duration
@@ -138,6 +145,9 @@ type PerfResult struct {
 	Ops         int
 	CPULimit    string
 	MemoryLimit string
+	// RunID identifies the repeat index (1..N) when each perf case is run more
+	// than once for variance smoothing.
+	RunID int
 
 	// ConfigMap create latency (write path → storage backend write)
 	WriteP50        time.Duration

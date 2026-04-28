@@ -22,9 +22,14 @@ BENCH_ENV     ?= $(BENCH_DIR)bench.env
 BENCH_STORAGE ?=
 BENCH_LARGE   ?=
 BENCH_PARALLEL?= 10
-BENCH_K0S_VER ?= v1.31.2-k0s.0
+BENCH_K0S_VER ?= v1.35.3-k0s.0
 SCALE_TIMEOUT ?= 4h
 PERF_TIMEOUT  ?= 2h
+# How many times to repeat each scenario for variance smoothing. Scale-bench
+# numbers are sums-over-many-pods and stable run-to-run; perf-bench tails are
+# sensitive to scheduler/GC/network jitter, so default to 3.
+BENCH_SCALE_RUNS ?= 1
+BENCH_PERF_RUNS  ?= 3
 PERF_OPS      ?= 500
 PERF_CONCURRENCY ?= 10
 PERF_HCP_CLIENT_QPS ?= 2000
@@ -105,21 +110,30 @@ fi; \
 if [ -n "$$BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE" ]; then export BENCH_WORKER_EXTERNAL_ADDRESSES="$$BENCH_WORKER_EXTERNAL_ADDRESSES_OVERRIDE"; fi
 endef
 
-.PHONY: help run scale perf perf-ha perf-unlimited perf-tiny perf-small perf-medium perf-large perf-ha-unlimited perf-ha-tiny perf-ha-small perf-ha-medium perf-ha-large all kubeconfig bench-env infra-up infra-down worker-limits k0smotron-stable deploy-local storage monitoring-extras
+PERF_SWEEP_CONCURRENCIES ?= 50 200 500 1000
+
+.PHONY: help run run-article article perf-presets perf-tuned-ab scale perf perf-ha perf-sweep perf-sweep-ha perf-unlimited perf-tiny perf-small perf-medium perf-large perf-ha-unlimited perf-ha-tiny perf-ha-small perf-ha-medium perf-ha-large all kubeconfig bench-env infra-up infra-down worker-limits k0smotron-stable deploy-local storage storage-tuned monitoring-extras
 
 help:
 	@echo "Targets:"
-	@echo "  run         provision + scale + perf + destroy  (requires KEY=)"
+	@echo "  run         provision + scale + perf + perf-ha + destroy  (quick, requires KEY=)"
+	@echo "  run-article provision + full article matrix + destroy     (LONG, requires KEY=)"
+	@echo "  article     full article matrix (scale + perf-sweep + perf-sweep-ha + perf-presets + perf-tuned-ab)"
+	@echo "  perf-presets         E4 — HCP resource preset sweep"
+	@echo "  perf-tuned-ab        E5 — postgres+mysql default vs tuned A/B"
 	@echo "  scale       run TestScaleMatrix  (auto-fetches kubeconfig)"
 	@echo "  perf        run single-node TestStoragePerformance  (auto-fetches kubeconfig)"
 	@echo "  perf-ha     run 3-node TestStoragePerformanceHA  (auto-fetches kubeconfig)"
 	@echo "  perf-{unlimited,tiny,small,medium,large}     run perf with resource preset"
 	@echo "  perf-ha-{unlimited,tiny,small,medium,large}  run HA perf with resource preset"
+	@echo "  perf-sweep    sweep concurrency \$$(PERF_SWEEP_CONCURRENCIES) (single-node)"
+	@echo "  perf-sweep-ha sweep concurrency \$$(PERF_SWEEP_CONCURRENCIES) (HA)"
 	@echo "  all         scale + perf + perf-ha"
 	@echo "  kubeconfig  fetch kubeconfig from observer → $(BENCH_DIR)kubeconfig"
 	@echo ""
 	@echo "  infra-up         provision EC2 cluster + storage backends (requires KEY=)"
-	@echo "  storage          apply postgres + mysql StatefulSets on the storage nodes"
+	@echo "  storage          apply postgres + mysql StatefulSets (default config)"
+	@echo "  storage-tuned    apply storage with tuned ConfigMaps (E5 A/B)"
 	@echo "  monitoring-extras apply ServiceMonitors for k0s-pushgateway + operator"
 	@echo "  worker-limits    raise worker node file-descriptor limits"
 	@echo "  k0smotron-stable install stable k0smotron from docs.k0smotron.io"
@@ -163,6 +177,7 @@ scale: kubeconfig bench-env
 	@$(LOAD_BENCH_ENV); \
 	$(GO_TEST) \
 	  -timeout $(SCALE_TIMEOUT) \
+	  -bench.runs=$(BENCH_SCALE_RUNS) \
 	  -bench.report=$(BENCH_DIR)bench-results.csv \
 	  -run TestScaleMatrix \
 	  $(BENCH_DIR)
@@ -171,6 +186,7 @@ perf: kubeconfig bench-env
 	@$(LOAD_BENCH_ENV); \
 	$(GO_TEST) \
 	  -timeout $(PERF_TIMEOUT) \
+	  -bench.runs=$(BENCH_PERF_RUNS) \
 	  -bench.perf-report=$(PERF_REPORT) \
 	  -bench.perf-ops=$(PERF_OPS) \
 	  -bench.perf-concurrency=$(PERF_CONCURRENCY) \
@@ -191,6 +207,7 @@ perf-ha: kubeconfig bench-env
 	@$(LOAD_BENCH_ENV); \
 	$(GO_TEST) \
 	  -timeout $(PERF_TIMEOUT) \
+	  -bench.runs=$(BENCH_PERF_RUNS) \
 	  -bench.perf-report=$(PERF_REPORT) \
 	  -bench.perf-ops=$(PERF_OPS) \
 	  -bench.perf-concurrency=$(PERF_CONCURRENCY) \
@@ -237,7 +254,66 @@ perf-ha-medium:
 perf-ha-large:
 	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=large
 
+# Concurrency sweep — runs `make perf` (single-node HCP) for each concurrency
+# point in PERF_SWEEP_CONCURRENCIES. PERF_OPS scales with concurrency so each
+# point takes roughly the same wall time. One CSV per concurrency point.
+perf-sweep:
+	@for c in $(PERF_SWEEP_CONCURRENCIES); do \
+	  ops=$$((c * 100)); \
+	  echo "=== perf sweep: concurrency=$$c ops=$$ops ==="; \
+	  $(MAKE) perf \
+	    PERF_CONCURRENCY=$$c \
+	    PERF_OPS=$$ops \
+	    PERF_REPORT=$(BENCH_DIR)bench-perf-results-c$$c.csv \
+	    || exit 1; \
+	done
+
+# HA variant of perf-sweep — same shape but `make perf-ha`.
+perf-sweep-ha:
+	@for c in $(PERF_SWEEP_CONCURRENCIES); do \
+	  ops=$$((c * 100)); \
+	  echo "=== perf-ha sweep: concurrency=$$c ops=$$ops ==="; \
+	  $(MAKE) perf-ha \
+	    PERF_CONCURRENCY=$$c \
+	    PERF_OPS=$$ops \
+	    PERF_REPORT=$(BENCH_DIR)bench-perf-results-ha-c$$c.csv \
+	    || exit 1; \
+	done
+
 all: scale perf perf-ha
+
+# ── Article-grade matrix ──────────────────────────────────────────────────── #
+# E1 + E2 + E3 + E4 + E5 from bench/PLAN.md, in order. Long runtime; expects
+# storage backends and operator already deployed (call from `run-article` for
+# the full pipeline). Each step writes its own CSV(s); aggregate.py merges.
+
+# E4 — HCP resource preset sweep on single-node, concurrency=200.
+perf-presets:
+	$(MAKE) perf-tiny
+	$(MAKE) perf-small
+	$(MAKE) perf-medium
+	$(MAKE) perf-large
+	$(MAKE) perf-unlimited
+
+# E5 — postgres + mysql at default vs tuned config, concurrency=200.
+# Writes two CSVs so the aggregator can A/B them.
+perf-tuned-ab:
+	$(MAKE) storage
+	$(MAKE) perf BENCH_STORAGE=kine-postgres,kine-mysql \
+	  PERF_CONCURRENCY=200 PERF_OPS=20000 \
+	  PERF_REPORT=$(BENCH_DIR)bench-perf-results-default-db.csv
+	$(MAKE) storage-tuned
+	$(MAKE) perf BENCH_STORAGE=kine-postgres,kine-mysql \
+	  PERF_CONCURRENCY=200 PERF_OPS=20000 \
+	  PERF_REPORT=$(BENCH_DIR)bench-perf-results-tuned-db.csv
+
+# Full article matrix (scale + perf sweeps + presets + tuned A/B).
+# Order: scale first (validates harness), then sweeps (longest leg), then
+# presets, then DB tuning A/B (mutates storage layer last).
+article: scale perf-sweep perf-sweep-ha perf-presets perf-tuned-ab
+
+# Full pipeline for the article: provision + article + destroy.
+run-article: infra-up deploy-local monitoring-extras article infra-down
 
 bench-env:
 	@mkdir -p "$(BENCH_DIR)"
@@ -284,6 +360,11 @@ deploy-local:
 # Already part of infra-up, but re-runnable on its own.
 storage:
 	$(INFRA_MAKE) storage
+
+# Same as `storage` but applies the tuned overlay (max_connections=2000,
+# sized innodb buffer pool / shared_buffers). Use for E5 A/B.
+storage-tuned:
+	$(INFRA_MAKE) storage-tuned
 
 # Apply ServiceMonitors for k0s-pushgateway + k0smotron operator. Run after
 # deploy-local / k0smotron-stable so the k0smotron namespace exists.

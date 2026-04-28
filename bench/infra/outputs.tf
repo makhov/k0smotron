@@ -27,6 +27,11 @@ output "mysql_node_ip" {
   value       = aws_instance.mysql.private_ip
 }
 
+output "minio_node_ip" {
+  description = "Private IP of the minio storage node (joined as a tainted k0s worker, hosts MinIO for t4 backends)"
+  value       = aws_instance.minio.private_ip
+}
+
 output "bench_env" {
   description = "Export these environment variables on the observer node before running benchmarks"
   value       = <<-EOT
@@ -58,6 +63,7 @@ output "destroy_reminder" {
       - 1 t3.medium  observer instance         (+ root gp3 volume)
       - 1 r6i.xlarge PostgreSQL instance       (+ root gp3 + data io2 volumes)
       - 1 r6i.xlarge MySQL instance            (+ root gp3 + data io2 volumes)
+      - 1 r6i.large  MinIO instance            (+ root gp3 + data io2 volumes)
     Make sure to retrieve any benchmark results BEFORE running terraform destroy.
   EOT
 }

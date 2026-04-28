@@ -129,7 +129,7 @@ go test -tags bench -v -timeout 4h \
   -bench.kubeconfig=$KUBECONFIG \
   -bench.parallel=20 \
   -bench.report=results-$(date +%Y%m%d).csv \
-  -bench.k0s-version=v1.31.2-k0s.0 \
+  -bench.k0s-version=v1.35.3-k0s.0 \
   ./bench/
 ```
 
@@ -139,7 +139,7 @@ go test -tags bench -v -timeout 4h \
 |----------------------|---------------------|------------------------------------------|
 | `-bench.kubeconfig`  | `$KUBECONFIG`       | Path to management cluster kubeconfig    |
 | `-bench.report`      | `bench-results.csv` | CSV output path (appends if file exists) |
-| `-bench.k0s-version` | `v1.31.2-k0s.0`     | k0s version deployed in each HCP         |
+| `-bench.k0s-version` | `v1.35.3-k0s.0`     | k0s version deployed in each HCP         |
 | `-bench.parallel`    | `10`                | Concurrent cluster creates per scenario  |
 | `-bench.storage`     | _(all)_             | Comma-separated list of backends to run  |
 | `-bench.large`       | `false`             | Add the 500-cluster scenario             |

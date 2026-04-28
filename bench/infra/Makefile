@@ -30,7 +30,7 @@ SSH_TIMEOUT ?= 600
 # Benchmark flags — passed through to go test
 BENCH_TIMEOUT  ?= 4h
 BENCH_PARALLEL ?= 10
-BENCH_K0S_VER  ?= v1.31.2-k0s.0
+BENCH_K0S_VER  ?= v1.35.3-k0s.0
 BENCH_STORAGE  ?=                      # empty = all enabled backends
 BENCH_LARGE    ?=                      # set to "--bench.large" to add 500-cluster run
 
@@ -61,7 +61,7 @@ SCP           = scp $(SSH_OPTS)
 # Targets
 # --------------------------------------------------------------------------- #
 
-.PHONY: help all infra-up run provision wait monitoring storage k0smotron-stable monitoring-extras worker-limits bench \
+.PHONY: help all infra-up run provision wait monitoring storage storage-tuned k0smotron-stable monitoring-extras worker-limits bench \
         prom-snapshot destroy image manifests deploy-local
 
 help:
@@ -72,7 +72,8 @@ help:
 	@echo "  provision     terraform apply (requires KEY=<ec2-key-pair>)"
 	@echo "  wait          wait for observer cloud-init + storage nodes Ready"
 	@echo "  monitoring        install cert-manager + metrics-server + Prometheus"
-	@echo "  storage           apply postgres + mysql StatefulSets on the tainted storage nodes"
+	@echo "  storage           apply postgres + mysql StatefulSets (default config)"
+	@echo "  storage-tuned     same but with tuning ConfigMaps (max_connections=2000 etc)"
 	@echo "  k0smotron-stable  install stable k0smotron from docs.k0smotron.io"
 	@echo "  monitoring-extras apply ServiceMonitors for k0s-pushgateway + k0smotron operator"
 	@echo "  worker-limits     raise worker node file-descriptor limits and restart k0s workers"
@@ -128,12 +129,13 @@ wait:
 	done; \
 	echo "Observer ready.                                    "; \
 	echo "SSH: ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP"; \
-	echo "Waiting for postgres + mysql storage nodes to join the k0s cluster..."; \
+	echo "Waiting for postgres + mysql + minio storage nodes to join the k0s cluster..."; \
 	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP "elapsed=0; \
 	  while : ; do \
 	    PG_READY=\$$(kubectl get nodes -l db=postgres -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null); \
 	    MY_READY=\$$(kubectl get nodes -l db=mysql    -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null); \
-	    [ \"\$$PG_READY\" = True ] && [ \"\$$MY_READY\" = True ] && break; \
+	    MN_READY=\$$(kubectl get nodes -l db=minio    -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null); \
+	    [ \"\$$PG_READY\" = True ] && [ \"\$$MY_READY\" = True ] && [ \"\$$MN_READY\" = True ] && break; \
 	    elapsed=\$$((elapsed + 5)); \
 	    if [ \$$elapsed -ge $(SSH_TIMEOUT) ]; then echo 'ERROR: timed out waiting for storage nodes'; kubectl get nodes -L db; exit 1; fi; \
 	    sleep 5; \
@@ -212,12 +214,33 @@ storage:
 	echo "Applying manifests..."; \
 	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'set -e; \
 	  ls -la ~/storage-manifests; \
-	  kubectl apply -k ~/storage-manifests; \
+	  kubectl apply -k ~/storage-manifests/default; \
 	  echo "Waiting for postgres rollout..."; \
-	  kubectl -n bench-storage rollout status statefulset/postgres --timeout=10m; \
+	  kubectl -n bench-storage   rollout status statefulset/postgres       --timeout=10m; \
 	  echo "Waiting for mysql rollout..."; \
-	  kubectl -n bench-storage rollout status statefulset/mysql    --timeout=10m; \
-	  kubectl -n bench-storage get pods,pvc'
+	  kubectl -n bench-storage   rollout status statefulset/mysql          --timeout=10m; \
+	  echo "Waiting for minio rollout..."; \
+	  kubectl -n bench-t4-system rollout status statefulset/bench-t4-minio --timeout=10m; \
+	  kubectl -n bench-storage   get pods,pvc; \
+	  kubectl -n bench-t4-system get pods,pvc'
+
+# Same as `storage` but applies the `tuned` overlay — postgres/mysql get a
+# tuned ConfigMap (max_connections=2000, sized buffers) mounted into the
+# StatefulSet. Use this for the E5 default-vs-tuned A/B experiment.
+storage-tuned:
+	@OBSERVER_IP=$$(cd $(TF_DIR) && terraform output -raw observer_ip); \
+	test -n "$$OBSERVER_IP" || { echo "ERROR: observer_ip empty"; exit 1; }; \
+	echo "Copying storage manifests (tuned) to $$OBSERVER_IP..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'rm -rf ~/storage-manifests' || exit 1; \
+	scp $(SSH_OPTS) -r $(TF_DIR)manifests/storage ubuntu@$$OBSERVER_IP:~/storage-manifests || exit 1; \
+	echo "Applying tuned overlay..."; \
+	ssh $(SSH_OPTS) ubuntu@$$OBSERVER_IP 'set -e; \
+	  kubectl apply -k ~/storage-manifests/tuned; \
+	  echo "Waiting for postgres rollout..."; \
+	  kubectl -n bench-storage   rollout status statefulset/postgres       --timeout=10m; \
+	  echo "Waiting for mysql rollout..."; \
+	  kubectl -n bench-storage   rollout status statefulset/mysql          --timeout=10m; \
+	  kubectl -n bench-storage   get pods,cm postgres-config,cm mysql-config'
 
 # Install stable k0smotron from docs.k0smotron.io
 k0smotron-stable:

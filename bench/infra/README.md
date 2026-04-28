@@ -77,7 +77,7 @@ make bench BENCH_PARALLEL=20 BENCH_K0S_VER=v1.32.0-k0s.0 BENCH_TIMEOUT=8h
 | `SSH_TIMEOUT`    | `600`           | Seconds to wait for observer bootstrap        |
 | `BENCH_TIMEOUT`  | `4h`            | `go test` timeout                             |
 | `BENCH_PARALLEL` | `10`            | Concurrent cluster creates                    |
-| `BENCH_K0S_VER`  | `v1.31.2-k0s.0` | k0s version for HCPs                          |
+| `BENCH_K0S_VER`  | `v1.35.3-k0s.0` | k0s version for HCPs                          |
 | `BENCH_STORAGE`  | _(all)_         | Comma-separated storage backends              |
 | `BENCH_LARGE`    | —               | Set to `--bench.large` to add 500-cluster run |
 
@@ -89,7 +89,7 @@ make bench BENCH_PARALLEL=20 BENCH_K0S_VER=v1.32.0-k0s.0 BENCH_TIMEOUT=8h
 | `az`                | `us-east-1a`             | Single AZ — all resources land here |
 | `key_name`          | —                        | EC2 key pair name                   |
 | `allowed_cidr`      | `0.0.0.0/0`              | CIDR for SSH + kubectl access       |
-| `k0s_version`       | `v1.31.2+k0s.0`          | k0s version for management cluster  |
+| `k0s_version`       | `v1.35.3+k0s.0`          | k0s version for management cluster  |
 | `postgres_password` | `bench_secret_change_me` | PostgreSQL bench user password      |
 | `mysql_password`    | `bench_secret_change_me` | MySQL bench user password           |
 | `s3_bucket_t4`      | —                        | S3 bucket for t4 storage backend    |

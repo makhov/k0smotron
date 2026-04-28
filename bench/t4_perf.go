@@ -24,11 +24,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	km "github.com/k0sproject/k0smotron/api/k0smotron.io/v1beta2"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -289,11 +287,15 @@ func ensureT4HeadlessService(ctx context.Context, namespace, clusterName, servic
 	return nil
 }
 
-var (
-	t4MinIOInfraOnce sync.Once
-	t4MinIOInfraErr  error
-)
-
+// ensureT4MinIO returns the endpoint + credentials of the MinIO instance
+// that runs on the dedicated `db=minio` storage node (provisioned by
+// terraform, deployed via bench/infra/manifests/storage/minio.yaml). The
+// bench harness only needs to wait for the Service to have endpoints and
+// then create the per-test bucket.
+//
+// The credentials are hardcoded in the manifest's Secret to match
+// t4DefaultAccessKey/t4DefaultSecretKey here. Setting BENCH_T4_S3_ENDPOINT
+// short-circuits the in-cluster path entirely (use a real S3 backend).
 func ensureT4MinIO(ctx context.Context, bucket string) (endpoint, accessKey, secretKey string, err error) {
 	accessKey = envOrDefault("BENCH_T4_S3_ACCESS_KEY_ID", t4DefaultAccessKey)
 	secretKey = envOrDefault("BENCH_T4_S3_SECRET_ACCESS_KEY", t4DefaultSecretKey)
@@ -305,165 +307,14 @@ func ensureT4MinIO(ctx context.Context, bucket string) (endpoint, accessKey, sec
 		return external, accessKey, secretKey, nil
 	}
 
-	if err := ensureT4MinIOInfra(ctx, accessKey, secretKey); err != nil {
-		return "", "", "", err
+	if err := waitServiceEndpoints(ctx, t4MinIONamespace, t4MinIOServiceName, 5*time.Minute); err != nil {
+		return "", "", "", fmt.Errorf("wait for minio service endpoints: %w (is `make storage` applied?)", err)
 	}
 	if err := ensureT4Bucket(ctx, accessKey, secretKey, bucket); err != nil {
 		return "", "", "", err
 	}
 
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:9000", t4MinIOServiceName, t4MinIONamespace), accessKey, secretKey, nil
-}
-
-// ensureT4MinIOInfra brings up the shared MinIO namespace, secret, service,
-// and deployment exactly once per process. Per-cluster bucket creation runs
-// outside the once-guard so distinct buckets can be created in parallel.
-func ensureT4MinIOInfra(ctx context.Context, accessKey, secretKey string) error {
-	t4MinIOInfraOnce.Do(func() {
-		if err := ensureNamespace(ctx, globalKC, t4MinIONamespace); err != nil {
-			t4MinIOInfraErr = fmt.Errorf("ensure t4 namespace: %w", err)
-			return
-		}
-		if err := ensureT4MinIOSecret(ctx, accessKey, secretKey); err != nil {
-			t4MinIOInfraErr = err
-			return
-		}
-		if err := ensureT4MinIOService(ctx); err != nil {
-			t4MinIOInfraErr = err
-			return
-		}
-		if err := ensureT4MinIODeployment(ctx); err != nil {
-			t4MinIOInfraErr = err
-			return
-		}
-		t4MinIOInfraErr = waitDeploymentReady(ctx, t4MinIONamespace, t4MinIOServiceName, 5*time.Minute)
-	})
-	return t4MinIOInfraErr
-}
-
-func ensureT4MinIOSecret(ctx context.Context, accessKey, secretKey string) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      t4MinIOCredsSecretName,
-			Namespace: t4MinIONamespace,
-		},
-		StringData: map[string]string{
-			"root-user":     accessKey,
-			"root-password": secretKey,
-		},
-	}
-	current, err := globalKC.CoreV1().Secrets(t4MinIONamespace).Get(ctx, t4MinIOCredsSecretName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		_, err = globalKC.CoreV1().Secrets(t4MinIONamespace).Create(ctx, secret, metav1.CreateOptions{})
-		return err
-	}
-	if err != nil {
-		return fmt.Errorf("get t4 minio secret: %w", err)
-	}
-	secret.ResourceVersion = current.ResourceVersion
-	_, err = globalKC.CoreV1().Secrets(t4MinIONamespace).Update(ctx, secret, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("update t4 minio secret: %w", err)
-	}
-	return nil
-}
-
-func ensureT4MinIOService(ctx context.Context) error {
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      t4MinIOServiceName,
-			Namespace: t4MinIONamespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": t4MinIOServiceName},
-			Ports: []corev1.ServicePort{{
-				Name:       "http",
-				Port:       9000,
-				TargetPort: intstr.FromInt(9000),
-			}},
-		},
-	}
-	current, err := globalKC.CoreV1().Services(t4MinIONamespace).Get(ctx, t4MinIOServiceName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		_, err = globalKC.CoreV1().Services(t4MinIONamespace).Create(ctx, svc, metav1.CreateOptions{})
-		return err
-	}
-	if err != nil {
-		return fmt.Errorf("get t4 minio service: %w", err)
-	}
-	svc.ResourceVersion = current.ResourceVersion
-	svc.Spec.ClusterIP = current.Spec.ClusterIP
-	svc.Spec.ClusterIPs = current.Spec.ClusterIPs
-	svc.Spec.IPFamilies = current.Spec.IPFamilies
-	svc.Spec.IPFamilyPolicy = current.Spec.IPFamilyPolicy
-	_, err = globalKC.CoreV1().Services(t4MinIONamespace).Update(ctx, svc, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("update t4 minio service: %w", err)
-	}
-	return nil
-}
-
-func ensureT4MinIODeployment(ctx context.Context) error {
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      t4MinIOServiceName,
-			Namespace: t4MinIONamespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: int32Ptr(1),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": t4MinIOServiceName},
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"app": t4MinIOServiceName},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Name:  "minio",
-						Image: envOrDefault("BENCH_T4_MINIO_IMAGE", "minio/minio:latest"),
-						Args:  []string{"server", "/data", "--address", ":9000"},
-						Env: []corev1.EnvVar{
-							{
-								Name: "MINIO_ROOT_USER",
-								ValueFrom: &corev1.EnvVarSource{
-									SecretKeyRef: &corev1.SecretKeySelector{
-										LocalObjectReference: corev1.LocalObjectReference{Name: t4MinIOCredsSecretName},
-										Key:                  "root-user",
-									},
-								},
-							},
-							{
-								Name: "MINIO_ROOT_PASSWORD",
-								ValueFrom: &corev1.EnvVarSource{
-									SecretKeyRef: &corev1.SecretKeySelector{
-										LocalObjectReference: corev1.LocalObjectReference{Name: t4MinIOCredsSecretName},
-										Key:                  "root-password",
-									},
-								},
-							},
-						},
-						Ports: []corev1.ContainerPort{{ContainerPort: 9000}},
-					}},
-				},
-			},
-		},
-	}
-
-	current, err := globalKC.AppsV1().Deployments(t4MinIONamespace).Get(ctx, t4MinIOServiceName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		_, err = globalKC.AppsV1().Deployments(t4MinIONamespace).Create(ctx, dep, metav1.CreateOptions{})
-		return err
-	}
-	if err != nil {
-		return fmt.Errorf("get t4 minio deployment: %w", err)
-	}
-	dep.ResourceVersion = current.ResourceVersion
-	_, err = globalKC.AppsV1().Deployments(t4MinIONamespace).Update(ctx, dep, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("update t4 minio deployment: %w", err)
-	}
-	return nil
 }
 
 func ensureT4Bucket(ctx context.Context, accessKey, secretKey, bucket string) error {

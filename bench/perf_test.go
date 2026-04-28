@@ -92,9 +92,16 @@ func runStoragePerformanceSuite(t *testing.T, reporter *PerfCSVReporter, replica
 		resultStorageName := sc.StorageName + nameSuffix
 		for _, profile := range selectedPerfProfiles(*perfProfile) {
 			profile := profile
-			t.Run(resultStorageName+"/"+profile, func(t *testing.T) {
-				runStoragePerformanceCase(t, reporter, sc, replicas, resultStorageName, profile)
-			})
+			totalRuns := *runs
+			if totalRuns < 1 {
+				totalRuns = 1
+			}
+			for runIdx := 1; runIdx <= totalRuns; runIdx++ {
+				runIdx := runIdx
+				t.Run(fmt.Sprintf("%s/%s/r%d", resultStorageName, profile, runIdx), func(t *testing.T) {
+					runStoragePerformanceCase(t, reporter, sc, replicas, resultStorageName, profile, runIdx)
+				})
+			}
 		}
 	}
 }
@@ -112,7 +119,7 @@ func selectedPerfProfiles(profile string) []string {
 	}
 }
 
-func runStoragePerformanceCase(t *testing.T, reporter *PerfCSVReporter, sc storageEntry, replicas int32, resultStorageName, profile string) {
+func runStoragePerformanceCase(t *testing.T, reporter *PerfCSVReporter, sc storageEntry, replicas int32, resultStorageName, profile string, runID int) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -122,7 +129,9 @@ func runStoragePerformanceCase(t *testing.T, reporter *PerfCSVReporter, sc stora
 		t.Fatalf("parse HCP resource limits: %v", err)
 	}
 
-	safeName := strings.ReplaceAll(resultStorageName+"-"+profile, "_", "-")
+	// Per-run namespace + cluster name keep repeats isolated so a slow
+	// previous-iteration cleanup can't collide with the next one.
+	safeName := strings.ReplaceAll(fmt.Sprintf("%s-%s-r%d", resultStorageName, profile, runID), "_", "-")
 	clusterName := "perf-" + safeName
 	mgmtNS := "bench-perf-" + safeName
 
@@ -185,6 +194,7 @@ func runStoragePerformanceCase(t *testing.T, reporter *PerfCSVReporter, sc stora
 	result.Profile = profile
 	result.Concurrency = *perfConcurrency
 	result.Ops = *perfOps
+	result.RunID = runID
 	result.CPULimit = *perfHCPCPULimit
 	result.MemoryLimit = *perfHCPMemoryLimit
 	result.HCPResourceSamples = resourceSummary.Samples

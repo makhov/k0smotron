@@ -23,8 +23,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +47,7 @@ var (
 	parallelism   = flag.Int("bench.parallel", 10, "concurrent cluster creates")
 	storageFilter = flag.String("bench.storage", "", "comma-separated storage types to run, empty=all")
 	largeCounts   = flag.Bool("bench.large", false, "include 500-cluster scenario (slow)")
+	runs          = flag.Int("bench.runs", 3, "repeat each scenario this many times for variance smoothing; rows tagged with run_id 1..N")
 
 	metricsInterval = flag.Duration("bench.metrics-interval", 10*time.Second, "interval between HCP/operator metrics samples during a scenario")
 
@@ -115,31 +118,42 @@ func TestScaleMatrix(t *testing.T) {
 		}
 		for _, n := range counts {
 			n := n
-			name := fmt.Sprintf("%s/n%d", sc.StorageName, n)
-			t.Run(name, func(t *testing.T) {
-				// Scenarios run sequentially on purpose — running them in
-				// parallel overwhelms a single-node management cluster's API
-				// server and skews measurements.
+			totalRuns := *runs
+			if totalRuns < 1 {
+				totalRuns = 1
+			}
+			for runIdx := 1; runIdx <= totalRuns; runIdx++ {
+				runIdx := runIdx
+				name := fmt.Sprintf("%s/n%d/r%d", sc.StorageName, n, runIdx)
+				t.Run(name, func(t *testing.T) {
+					// Scenarios run sequentially on purpose — running them in
+					// parallel overwhelms a single-node management cluster's API
+					// server and skews measurements.
 
-				cfg := ScenarioConfig{
-					StorageName:      sc.StorageName,
-					StorageType:      sc.StorageType,
-					StorageKine:      sc.StorageKine,
-					StorageEtcd:      sc.StorageEtcd,
-					StorageNATS:      sc.StorageNATS,
-					StorageNamespace: sc.StorageNamespace,
-					Patches:          scaleFastProbePatches(),
-					ClusterCount:     n,
-					Parallelism:      *parallelism,
-					K0sVersion:       *k0sVersion,
-					Namespace:        fmt.Sprintf("bench-%s-%d", sc.StorageName, n),
-				}
+					cfg := ScenarioConfig{
+						StorageName:      sc.StorageName,
+						StorageType:      sc.StorageType,
+						StorageKine:      sc.StorageKine,
+						StorageEtcd:      sc.StorageEtcd,
+						StorageNATS:      sc.StorageNATS,
+						StorageNamespace: sc.StorageNamespace,
+						Patches:          scaleFastProbePatches(),
+						ClusterCount:     n,
+						Parallelism:      *parallelism,
+						K0sVersion:       *k0sVersion,
+						// Per-run namespace keeps repeats isolated even if a
+						// previous scenario's namespace cleanup is still in
+						// progress when the next run starts.
+						Namespace: fmt.Sprintf("bench-%s-%d-r%d", sc.StorageName, n, runIdx),
+						RunID:     runIdx,
+					}
 
-				if _, err := runScenario(t, cfg, reporter.Append); err != nil {
-					t.Errorf("scenario %s failed: %v", name, err)
-					return
-				}
-			})
+					if _, err := runScenario(t, cfg, reporter.Append); err != nil {
+						t.Errorf("scenario %s failed: %v", name, err)
+						return
+					}
+				})
+			}
 		}
 	}
 }
@@ -155,6 +169,7 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 		StorageName:  cfg.StorageName,
 		ClusterCount: cfg.ClusterCount,
 		Parallelism:  cfg.Parallelism,
+		RunID:        cfg.RunID,
 	}
 
 	// Always record whatever we have on the way out — covers normal return,
@@ -213,6 +228,11 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 	result.ProvisionP50, result.ProvisionP95, result.ProvisionP99, result.ProvisionMax = percentiles(provDurations)
 	t.Logf("provisioning p50=%s p95=%s p99=%s max=%s",
 		result.ProvisionP50, result.ProvisionP95, result.ProvisionP99, result.ProvisionMax)
+
+	// Sanity: log how HCP pods spread across worker nodes. A skewed
+	// distribution (one worker hosting >30% more pods than the mean) can bias
+	// the resource numbers — catch it before it shows up as noise.
+	logHCPDistribution(ctx, t, globalKC, cfg.Namespace)
 
 	// 6. Steady-state window. Sampler keeps ticking through this so we still
 	// pick up settled-load mem/cpu.
@@ -439,4 +459,60 @@ func parseFilter(s string) map[string]bool {
 		}
 	}
 	return m
+}
+
+// logHCPDistribution lists HCP pods in the scenario namespace, groups them by
+// node, and logs the per-node count. Warns when the spread (max-min)/mean
+// exceeds 30% — that level of skew biases the resource numbers because one
+// worker takes disproportionately more load than its peers.
+func logHCPDistribution(ctx context.Context, t *testing.T, kc *kubernetes.Clientset, namespace string) {
+	t.Helper()
+	pods, err := kc.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=k0smotron,component=cluster",
+	})
+	if err != nil {
+		t.Logf("warning: HCP distribution check failed: %v", err)
+		return
+	}
+	perNode := make(map[string]int)
+	for _, p := range pods.Items {
+		if p.Spec.NodeName == "" {
+			continue
+		}
+		perNode[p.Spec.NodeName]++
+	}
+	if len(perNode) == 0 {
+		return
+	}
+
+	nodes := make([]string, 0, len(perNode))
+	for n := range perNode {
+		nodes = append(nodes, n)
+	}
+	sort.Strings(nodes)
+
+	parts := make([]string, 0, len(nodes))
+	minCount, maxCount, total := math.MaxInt, 0, 0
+	for _, n := range nodes {
+		c := perNode[n]
+		parts = append(parts, fmt.Sprintf("%s=%d", n, c))
+		if c < minCount {
+			minCount = c
+		}
+		if c > maxCount {
+			maxCount = c
+		}
+		total += c
+	}
+	t.Logf("HCP distribution: %s (total=%d nodes=%d)", strings.Join(parts, " "), total, len(perNode))
+
+	mean := float64(total) / float64(len(perNode))
+	if mean == 0 {
+		return
+	}
+	skew := float64(maxCount-minCount) / mean
+	if skew > 0.30 {
+		t.Logf("WARN: HCP distribution skew %.0f%% (min=%d max=%d mean=%.1f) — resource totals may be biased",
+			skew*100, minCount, maxCount, mean)
+	}
 }
