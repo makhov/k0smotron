@@ -308,9 +308,12 @@ perf-tuned-ab:
 	  PERF_REPORT=$(BENCH_DIR)bench-perf-results-tuned-db.csv
 
 # Full article matrix (scale + perf sweeps + presets + tuned A/B).
-# Order: scale first (validates harness), then sweeps (longest leg), then
-# presets, then DB tuning A/B (mutates storage layer last).
-article: scale perf-sweep perf-sweep-ha perf-presets perf-tuned-ab
+# Order: switch storage to tuned first so E1-E4 measure capacity / perf
+# without hitting default-DB connection-limit walls (postgres
+# max_connections=100, mysql=151 saturate at 100 HCPs / concurrency 200).
+# E5 (perf-tuned-ab) then toggles back to default to capture the trap
+# explicitly for §4 of the article. Cluster ends in tuned state.
+article: storage-tuned scale perf-sweep perf-sweep-ha perf-presets perf-tuned-ab
 
 # Full pipeline for the article: provision + article + destroy.
 run-article: infra-up deploy-local monitoring-extras article infra-down
