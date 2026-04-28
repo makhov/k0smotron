@@ -45,6 +45,7 @@ PERF_PROFILE ?= create-list
 PERF_WATCHERS ?= 25
 PERF_WATCH_DRAIN ?= 10s
 
+PERF_SWEEP_OPS ?= 10000
 PERF_HCP_PRESET_CPU_unlimited :=
 PERF_HCP_PRESET_MEM_unlimited :=
 PERF_HCP_PRESET_CPU_tiny := 250m
@@ -126,8 +127,8 @@ help:
 	@echo "  perf-ha     run 3-node TestStoragePerformanceHA  (auto-fetches kubeconfig)"
 	@echo "  perf-{unlimited,tiny,small,medium,large}     run perf with resource preset"
 	@echo "  perf-ha-{unlimited,tiny,small,medium,large}  run HA perf with resource preset"
-	@echo "  perf-sweep    sweep concurrency \$$(PERF_SWEEP_CONCURRENCIES) (single-node)"
-	@echo "  perf-sweep-ha sweep concurrency \$$(PERF_SWEEP_CONCURRENCIES) (HA)"
+	@echo "  perf-sweep    sweep concurrency \$$(PERF_SWEEP_CONCURRENCIES) with \$$(PERF_SWEEP_OPS) ops (single-node)"
+	@echo "  perf-sweep-ha sweep concurrency \$$(PERF_SWEEP_CONCURRENCIES) with \$$(PERF_SWEEP_OPS) ops (HA)"
 	@echo "  all         scale + perf + perf-ha"
 	@echo "  kubeconfig  fetch kubeconfig from observer → $(BENCH_DIR)kubeconfig"
 	@echo ""
@@ -142,7 +143,7 @@ help:
 	@echo ""
 	@echo "Key vars: KUBECONFIG KEY CIDR BENCH_STORAGE BENCH_LARGE"
 	@echo "          BENCH_PARALLEL BENCH_K0S_VER SCALE_TIMEOUT PERF_TIMEOUT"
-	@echo "          PERF_OPS PERF_CONCURRENCY PERF_RESOURCE_SAMPLE_INTERVAL PERF_REPORT"
+	@echo "          PERF_OPS PERF_CONCURRENCY PERF_SWEEP_OPS PERF_RESOURCE_SAMPLE_INTERVAL PERF_REPORT"
 	@echo "          PERF_HCP_RESOURCE_PRESET PERF_HCP_CPU_LIMIT PERF_HCP_MEMORY_LIMIT"
 	@echo "          PERF_REQUEST_TIMEOUT PERF_PHASE_TIMEOUT"
 	@echo "          PERF_PROFILE PERF_WATCHERS PERF_WATCH_DRAIN"
@@ -255,11 +256,10 @@ perf-ha-large:
 	$(MAKE) perf-ha PERF_HCP_RESOURCE_PRESET=large
 
 # Concurrency sweep — runs `make perf` (single-node HCP) for each concurrency
-# point in PERF_SWEEP_CONCURRENCIES. PERF_OPS scales with concurrency so each
-# point takes roughly the same wall time. One CSV per concurrency point.
+# point in PERF_SWEEP_CONCURRENCIES. One CSV per concurrency point.
 perf-sweep:
 	@for c in $(PERF_SWEEP_CONCURRENCIES); do \
-	  ops=$$((c * 100)); \
+	  ops=$(PERF_SWEEP_OPS); \
 	  echo "=== perf sweep: concurrency=$$c ops=$$ops ==="; \
 	  $(MAKE) perf \
 	    PERF_CONCURRENCY=$$c \
@@ -271,7 +271,7 @@ perf-sweep:
 # HA variant of perf-sweep — same shape but `make perf-ha`.
 perf-sweep-ha:
 	@for c in $(PERF_SWEEP_CONCURRENCIES); do \
-	  ops=$$((c * 100)); \
+	  ops=$(PERF_SWEEP_OPS); \
 	  echo "=== perf-ha sweep: concurrency=$$c ops=$$ops ==="; \
 	  $(MAKE) perf-ha \
 	    PERF_CONCURRENCY=$$c \

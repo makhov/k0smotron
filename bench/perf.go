@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
@@ -249,44 +248,89 @@ func runWriteLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespace st
 	}
 
 	total := warmup + ops
-	results := make([]resultWithError, total)
-	sem := make(chan struct{}, concurrency)
+	cleanup := startAsyncConfigMapCleanup(hcpKC, namespace, concurrency, total)
+	results := runIndexedLoad(ctx, total, concurrency, func(loadCtx context.Context, i int) resultWithError {
+		name := fmt.Sprintf("load-%06d", i)
+		reqCtx, cancel := context.WithTimeout(loadCtx, requestTimeout)
+		defer cancel()
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Data:       map[string]string{"index": fmt.Sprintf("%d", i)},
+		}
 
-	eg, egCtx := errgroup.WithContext(ctx)
-	for i := range total {
-		i := i
-		eg.Go(func() error {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			name := fmt.Sprintf("load-%06d", i)
-			reqCtx, cancel := context.WithTimeout(egCtx, requestTimeout)
-			defer cancel()
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-				Data:       map[string]string{"index": fmt.Sprintf("%d", i)},
-			}
-
-			start := time.Now()
-			_, createErr := hcpKC.CoreV1().ConfigMaps(namespace).Create(reqCtx, cm, metav1.CreateOptions{})
-			if createErr != nil && apierrors.IsAlreadyExists(createErr) {
-				createErr = nil
-			}
-			results[i] = resultWithError{dur: time.Since(start), err: createErr}
-
-			// async cleanup — don't block the measurement
-			go func() {
-				_ = hcpKC.CoreV1().ConfigMaps(namespace).Delete(
-					context.Background(), name, metav1.DeleteOptions{})
-			}()
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return loadResult{Errors: ops, FirstErr: err}
-	}
+		start := time.Now()
+		_, createErr := hcpKC.CoreV1().ConfigMaps(namespace).Create(reqCtx, cm, metav1.CreateOptions{})
+		if createErr != nil && apierrors.IsAlreadyExists(createErr) {
+			createErr = nil
+		}
+		select {
+		case cleanup <- name:
+		default:
+		}
+		return resultWithError{dur: time.Since(start), err: createErr}
+	})
+	close(cleanup)
 
 	return measuredLoadResult(results, warmup)
+}
+
+func runIndexedLoad(ctx context.Context, total, concurrency int, run func(context.Context, int) resultWithError) []resultWithError {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	results := make([]resultWithError, total)
+	jobs := make(chan int)
+
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i] = run(ctx, i)
+			}
+		}()
+	}
+
+	sent := 0
+send:
+	for sent < total {
+		select {
+		case <-ctx.Done():
+			break send
+		case jobs <- sent:
+			sent++
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if sent < total {
+		err := ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
+		for i := sent; i < total; i++ {
+			results[i] = resultWithError{err: err}
+		}
+	}
+	return results
+}
+
+func startAsyncConfigMapCleanup(hcpKC *kubernetes.Clientset, namespace string, workers, buffer int) chan string {
+	if workers < 1 {
+		workers = 1
+	}
+	cleanup := make(chan string, buffer)
+	for range workers {
+		go func() {
+			for name := range cleanup {
+				_ = hcpKC.CoreV1().ConfigMaps(namespace).Delete(
+					context.Background(), name, metav1.DeleteOptions{})
+			}
+		}()
+	}
+	return cleanup
 }
 
 func measuredLoadResult(results []resultWithError, warmup int) loadResult {
@@ -309,27 +353,13 @@ func measuredLoadResult(results []resultWithError, warmup int) loadResult {
 // concurrency. Returns per-List durations for the measured ops.
 func runReadLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespace string, ops, concurrency, warmup int, requestTimeout time.Duration) loadResult {
 	total := warmup + ops
-	results := make([]resultWithError, total)
-	sem := make(chan struct{}, concurrency)
-
-	eg, egCtx := errgroup.WithContext(ctx)
-	for i := 0; i < total; i++ {
-		i := i
-		eg.Go(func() error {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			reqCtx, cancel := context.WithTimeout(egCtx, requestTimeout)
-			defer cancel()
-			start := time.Now()
-			_, listErr := hcpKC.CoreV1().ConfigMaps(namespace).List(reqCtx, metav1.ListOptions{})
-			results[i] = resultWithError{dur: time.Since(start), err: listErr}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return loadResult{Errors: ops, FirstErr: err}
-	}
+	results := runIndexedLoad(ctx, total, concurrency, func(loadCtx context.Context, _ int) resultWithError {
+		reqCtx, cancel := context.WithTimeout(loadCtx, requestTimeout)
+		defer cancel()
+		start := time.Now()
+		_, listErr := hcpKC.CoreV1().ConfigMaps(namespace).List(reqCtx, metav1.ListOptions{})
+		return resultWithError{dur: time.Since(start), err: listErr}
+	})
 	return measuredLoadResult(results, warmup)
 }
 
@@ -599,27 +629,13 @@ func watchErrorString(event watchapi.Event) string {
 
 func runConfigMapChurn(ctx context.Context, hcpKC *kubernetes.Clientset, namespace, runID string, ops, concurrency, warmup int, requestTimeout time.Duration) (loadResult, map[string]opStat) {
 	total := warmup + ops
-	results := make([]resultWithError, total)
 	opResults := make([][]string, total) // per-lifecycle: list of ops that succeeded; last entry is the failed op when err != nil
-	sem := make(chan struct{}, concurrency)
-
-	eg, egCtx := errgroup.WithContext(ctx)
-	for i := 0; i < total; i++ {
-		i := i
-		eg.Go(func() error {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			start := time.Now()
-			completed, err := churnConfigMap(egCtx, hcpKC, namespace, runID, i, requestTimeout)
-			results[i] = resultWithError{dur: time.Since(start), err: err}
-			opResults[i] = completed
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return loadResult{Errors: ops, FirstErr: err}, nil
-	}
+	results := runIndexedLoad(ctx, total, concurrency, func(loadCtx context.Context, i int) resultWithError {
+		start := time.Now()
+		completed, err := churnConfigMap(loadCtx, hcpKC, namespace, runID, i, requestTimeout)
+		opResults[i] = completed
+		return resultWithError{dur: time.Since(start), err: err}
+	})
 	return measuredLoadResult(results, warmup), aggregateOpStats(results, opResults, warmup)
 }
 
