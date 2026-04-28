@@ -145,9 +145,20 @@ func runStoragePerformanceCase(t *testing.T, reporter *PerfCSVReporter, sc stora
 	if err := ensureNamespace(ctx, globalKC, mgmtNS); err != nil {
 		t.Fatalf("ensure namespace: %v", err)
 	}
+	// Synchronously wait for namespace teardown after this run finishes.
+	// Without the wait, run N+1 starts while run N's HCP StatefulSet + helm
+	// release + (for t4-standalone) the standalone t4 STS are still being
+	// reaped, which contends on the apiserver and on MinIO and has caused
+	// run N+1's helm install to time out.
 	defer func() {
+		t.Logf("[%s] cleaning up namespace %q (blocking, 5m timeout)", resultStorageName, mgmtNS)
 		_ = globalKC.CoreV1().Namespaces().Delete(
 			context.Background(), mgmtNS, metav1.DeleteOptions{})
+		waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := waitNamespaceDeleted(waitCtx, globalKC, mgmtNS); err != nil {
+			t.Logf("[%s] warning: namespace %q did not finish deleting in 5m: %v", resultStorageName, mgmtNS, err)
+		}
 	}()
 
 	cfg, err := configurePerfScenario(ctx, sc, clusterName, mgmtNS, nodeAddrs, replicas, *k0sVersion)

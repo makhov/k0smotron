@@ -190,11 +190,19 @@ func runScenario(t *testing.T, cfg ScenarioConfig, record resultRecorder) (RunRe
 		return result, fmt.Errorf("ensure namespace: %w", err)
 	}
 	defer func() {
-		t.Logf("cleaning up namespace %q", cfg.Namespace)
+		t.Logf("cleaning up namespace %q (blocking, 10m timeout)", cfg.Namespace)
 		if err := globalKC.CoreV1().Namespaces().Delete(
 			context.Background(), cfg.Namespace, metav1.DeleteOptions{},
 		); err != nil && !apierrors.IsNotFound(err) {
 			t.Logf("warning: failed to delete namespace %q: %v", cfg.Namespace, err)
+		}
+		// Block until the namespace is fully gone before this scenario's
+		// subtest returns. Run N+1 (and the next scenario) start with a
+		// quiet mgmt cluster — no HCP teardown work in flight.
+		waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if err := waitNamespaceDeleted(waitCtx, globalKC, cfg.Namespace); err != nil {
+			t.Logf("warning: namespace %q did not finish deleting in 10m: %v", cfg.Namespace, err)
 		}
 	}()
 

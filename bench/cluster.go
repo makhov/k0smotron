@@ -230,6 +230,30 @@ func waitClusterDeleted(ctx context.Context, kc *kubernetes.Clientset, name, ns 
 	}
 }
 
+// waitNamespaceDeleted blocks until the named namespace is fully gone, i.e.
+// `Get` returns NotFound. Used between perf-bench repeats so run N+1 doesn't
+// race the still-Terminating namespace from run N (whose helm release, HCP
+// StatefulSet, and per-cluster t4 StatefulSet are all being GC'd).
+func waitNamespaceDeleted(ctx context.Context, kc *kubernetes.Clientset, name string) error {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		_, err := kc.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("get namespace %s while waiting for deletion: %w", name, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // isNotFound returns (true, nil) when err is a NotFound, (false, nil) when the
 // object exists, and (false, err) for any other error. The first return value
 // of the wrapped Get is intentionally discarded — only the error matters.
