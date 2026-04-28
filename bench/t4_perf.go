@@ -20,6 +20,8 @@ package bench
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -468,11 +470,20 @@ func envOrDefault(key, fallback string) string {
 }
 
 func t4BucketJobName(bucket string) string {
-	name := "bench-t4-minio-bucket-" + bucket
-	if len(name) > 63 {
-		name = name[:63]
+	// Hash suffix keeps the name unique even after the 63-char DNS-label
+	// truncation drops the trailing characters of the bucket name. Without
+	// this, "bench-t4-...-r1" and "bench-t4-...-r2" produced the same Job
+	// name and r2's bucket-create was incorrectly skipped.
+	h := sha1.Sum([]byte(bucket))
+	suffix := "-" + hex.EncodeToString(h[:])[:8]
+	const max = 63
+	prefix := "bench-t4-minio-bucket-"
+	available := max - len(prefix) - len(suffix)
+	body := bucket
+	if len(body) > available {
+		body = body[:available]
 	}
-	return strings.TrimRight(name, "-")
+	return strings.TrimRight(prefix+body, "-") + suffix
 }
 
 func t4BucketName(clusterName string) string {
