@@ -240,7 +240,8 @@ storage-tuned:
 	  kubectl -n bench-storage   rollout status statefulset/postgres       --timeout=10m; \
 	  echo "Waiting for mysql rollout..."; \
 	  kubectl -n bench-storage   rollout status statefulset/mysql          --timeout=10m; \
-	  kubectl -n bench-storage   get pods,cm postgres-config,cm mysql-config'
+	  kubectl -n bench-storage get pods; \
+	  kubectl -n bench-storage get cm postgres-config mysql-config'
 
 # Install stable k0smotron from docs.k0smotron.io
 k0smotron-stable:
