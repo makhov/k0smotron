@@ -1,6 +1,12 @@
 ###############################################################################
 # MySQL tuning ConfigMap, applied only by the `tuned` overlay.
-# Sized for the r6i.xlarge node (4 vCPU / 32 GiB / io2 5000 IOPS).
+#
+# Minimal tuning: only `max_connections` is raised. Default mysql allows
+# 151 connections; kine sidecars open 2-5 each, so 100+ HCPs hit
+# "Error 1040: Too many connections". Bumping to 500 is the realistic
+# day-1 fix. All other settings (innodb_buffer_pool_size,
+# innodb_io_capacity, etc.) stay at image defaults so the article's perf
+# numbers reflect a minimum-effort install.
 ###############################################################################
 apiVersion: v1
 kind: ConfigMap
@@ -10,15 +16,4 @@ metadata:
 data:
   my.cnf: |
     [mysqld]
-    bind-address = 0.0.0.0
-    max_connections = 2000
-    innodb_buffer_pool_size = 20G
-    innodb_log_file_size = 1G
-    innodb_flush_log_at_trx_commit = 1
-    innodb_flush_method = O_DIRECT
-    innodb_io_capacity = 4000
-    innodb_io_capacity_max = 8000
-    innodb_read_io_threads = 8
-    innodb_write_io_threads = 8
-    sync_binlog = 1
-    skip_name_resolve = 1
+    max_connections = 500

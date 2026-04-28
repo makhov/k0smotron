@@ -269,6 +269,9 @@ func runWriteLoad(ctx context.Context, hcpKC *kubernetes.Clientset, namespace st
 
 			start := time.Now()
 			_, createErr := hcpKC.CoreV1().ConfigMaps(namespace).Create(reqCtx, cm, metav1.CreateOptions{})
+			if createErr != nil && apierrors.IsAlreadyExists(createErr) {
+				createErr = nil
+			}
 			results[i] = resultWithError{dur: time.Since(start), err: createErr}
 
 			// async cleanup — don't block the measurement
