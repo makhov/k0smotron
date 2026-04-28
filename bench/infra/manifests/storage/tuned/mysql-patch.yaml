@@ -1,0 +1,23 @@
+###############################################################################
+# Strategic-merge patch: drop the tuned my.cnf into /etc/mysql/conf.d/ so
+# mysqld picks it up at startup. Mounted via subPath so the rest of conf.d
+# stays untouched.
+###############################################################################
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: bench-storage
+spec:
+  template:
+    spec:
+      containers:
+        - name: mysql
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mysql/conf.d/my.cnf
+              subPath: my.cnf
+      volumes:
+        - name: config
+          configMap:
+            name: mysql-config

@@ -1,0 +1,24 @@
+###############################################################################
+# Scrapes k0s system components (kube-scheduler, kube-controller-manager, etcd,
+# kine) via the k0s-pushgateway deployed in k0s-system when controllers are
+# installed with --enable-metrics-scraper.
+###############################################################################
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k0s-pushgateway
+  namespace: monitoring
+  labels:
+    release: prom
+spec:
+  namespaceSelector:
+    matchNames: [k0s-system]
+  selector:
+    matchLabels:
+      app: k0s-observability
+      component: pushgateway
+      k0s.k0sproject.io/stack: metrics
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

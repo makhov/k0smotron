@@ -1,0 +1,154 @@
+###############################################################################
+# Postgres storage backend, running on the dedicated tainted node provisioned
+# by terraform (label db=postgres, taint dedicated=postgres:NoSchedule).
+# The io2 data disk is mounted at /var/lib/postgres-data on the host and
+# exposed as a Local PV bound by nodeAffinity.
+###############################################################################
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: bench-storage
+type: Opaque
+stringData:
+  POSTGRES_USER: bench
+  POSTGRES_PASSWORD: benchpass
+  POSTGRES_DB: bench
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-data
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bench-local
+  local:
+    path: /var/lib/postgres-data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: db
+              operator: In
+              values: [postgres]
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: bench-storage
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: bench-local
+  resources:
+    requests:
+      storage: 100Gi
+  volumeName: postgres-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: bench-storage
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+    - name: metrics
+      port: 9187
+      targetPort: 9187
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: bench-storage
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      nodeSelector:
+        db: postgres
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: postgres
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          env:
+            # Subdir avoids the ext4 lost+found at the volume root.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "bench", "-d", "bench"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+        - name: exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+          env:
+            - name: DATA_SOURCE_NAME
+              value: "postgresql://bench:benchpass@localhost:5432/bench?sslmode=disable"
+          ports:
+            - containerPort: 9187
+              name: metrics
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: postgres-exporter
+  namespace: bench-storage
+  labels:
+    release: prom
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s

@@ -1,0 +1,137 @@
+###############################################################################
+# MinIO storage backend, running on the dedicated tainted node provisioned
+# by terraform (label db=minio, taint dedicated=minio:NoSchedule).
+# The io2 data disk is mounted at /var/lib/minio-data on the host and exposed
+# as a Local PV bound by nodeAffinity.
+#
+# Used by the t4 family of scenarios (kine-t4, t4-standalone) as the
+# S3-compatible object store. Other scenarios ignore it.
+###############################################################################
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench-t4-system
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bench-t4-minio-creds
+  namespace: bench-t4-system
+type: Opaque
+stringData:
+  root-user: benchminio
+  root-password: benchminiosecret
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minio-data
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bench-local
+  local:
+    path: /var/lib/minio-data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: db
+              operator: In
+              values: [minio]
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: bench-t4-system
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: bench-local
+  resources:
+    requests:
+      storage: 100Gi
+  volumeName: minio-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-t4-minio
+  namespace: bench-t4-system
+  labels:
+    app: bench-t4-minio
+spec:
+  type: ClusterIP
+  selector:
+    app: bench-t4-minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bench-t4-minio
+  namespace: bench-t4-system
+spec:
+  serviceName: bench-t4-minio
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bench-t4-minio
+  template:
+    metadata:
+      labels:
+        app: bench-t4-minio
+    spec:
+      nodeSelector:
+        db: minio
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: minio
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--address", ":9000"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: bench-t4-minio-creds
+                  key: root-user
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bench-t4-minio-creds
+                  key: root-password
+          ports:
+            - containerPort: 9000
+              name: api
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data

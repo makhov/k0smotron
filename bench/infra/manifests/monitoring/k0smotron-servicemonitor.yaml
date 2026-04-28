@@ -1,0 +1,24 @@
+###############################################################################
+# Scrapes the k0smotron operator's controller-runtime diagnostics endpoint.
+# The Service this targets is appended to install.yaml by `make manifests`.
+###############################################################################
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k0smotron-controller-metrics
+  namespace: monitoring
+  labels:
+    # kube-prometheus-stack default release selector
+    release: prom
+spec:
+  namespaceSelector:
+    matchNames: [k0smotron]
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/part-of: k0smotron
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scheme: http

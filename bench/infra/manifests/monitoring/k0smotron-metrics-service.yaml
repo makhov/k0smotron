@@ -1,0 +1,23 @@
+###############################################################################
+# Service exposing the k0smotron operator's controller-runtime diagnostics
+# endpoint (/metrics) for Prometheus scraping. The Deployment binds on
+# 127.0.0.1:8080 by default; `make manifests` sed-patches install.yaml to bind
+# on :8080 so this Service can reach it.
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: k0smotron-controller-metrics
+  namespace: k0smotron
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/part-of: k0smotron
+spec:
+  selector:
+    cluster.x-k8s.io/provider: k0sproject-k0smotron
+    control-plane: controller-manager
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

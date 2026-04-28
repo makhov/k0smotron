@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Default storage stack — postgres + mysql + minio with no tuning patches.
+# Apply with: kubectl apply -k bench/infra/manifests/storage/default
+
+resources:
+  - ../base

@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Apply with: kubectl apply -k bench/infra/manifests/storage
+# (After terraform apply has joined the postgres + mysql nodes to the cluster.)
+
+resources:
+  - namespace.yaml
+  - storageclass.yaml
+  - postgres.yaml
+  - mysql.yaml
+  - minio.yaml

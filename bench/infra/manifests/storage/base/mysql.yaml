@@ -1,0 +1,178 @@
+###############################################################################
+# MySQL storage backend, running on the dedicated tainted node provisioned
+# by terraform (label db=mysql, taint dedicated=mysql:NoSchedule).
+# The io2 data disk is mounted at /var/lib/mysql-data on the host and
+# exposed as a Local PV bound by nodeAffinity.
+###############################################################################
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-credentials
+  namespace: bench-storage
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: benchpass
+  MYSQL_USER: bench
+  MYSQL_PASSWORD: benchpass
+  MYSQL_DATABASE: bench
+  # mysqld_exporter v0.15+ requires a my.cnf with [client] credentials.
+  # Mounted into the exporter sidecar via subPath.
+  exporter.my.cnf: |
+    [client]
+    user = bench
+    password = benchpass
+    host = 127.0.0.1
+    port = 3306
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-data
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bench-local
+  local:
+    path: /var/lib/mysql-data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: db
+              operator: In
+              values: [mysql]
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+  namespace: bench-storage
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: bench-local
+  resources:
+    requests:
+      storage: 100Gi
+  volumeName: mysql-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: bench-storage
+  labels:
+    app: mysql
+spec:
+  type: ClusterIP
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+    - name: metrics
+      port: 9104
+      targetPort: 9104
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: bench-storage
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      nodeSelector:
+        db: mysql
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: mysql
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          envFrom:
+            - secretRef:
+                name: mysql-credentials
+          ports:
+            - containerPort: 3306
+              name: mysql
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          readinessProbe:
+            exec:
+              command:
+                - bash
+                - -c
+                - mysqladmin ping -h 127.0.0.1 -u root -p"$MYSQL_ROOT_PASSWORD"
+            initialDelaySeconds: 30
+            periodSeconds: 5
+        - name: exporter
+          image: prom/mysqld-exporter:v0.15.1
+          args:
+            - "--config.my-cnf=/etc/mysqld-exporter/my.cnf"
+            - "--collect.info_schema.innodb_metrics"
+            - "--collect.global_status"
+            - "--collect.global_variables"
+            # Single-node mysql — no replication. Disable replication scrapers
+            # so the exporter doesn't spam errors about missing SUPER/REPLICATION
+            # CLIENT grants on the bench user.
+            - "--no-collect.slave_status"
+          ports:
+            - containerPort: 9104
+              name: metrics
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          volumeMounts:
+            - name: exporter-config
+              mountPath: /etc/mysqld-exporter/my.cnf
+              subPath: exporter.my.cnf
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mysql-data
+        - name: exporter-config
+          secret:
+            secretName: mysql-credentials
+            items:
+              - key: exporter.my.cnf
+                path: exporter.my.cnf
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mysqld-exporter
+  namespace: bench-storage
+  labels:
+    release: prom
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
