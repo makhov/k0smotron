@@ -365,6 +365,12 @@ manifests:
 	# The Service + ServiceMonitor live in manifests/monitoring/ and are applied
 	# by `make monitoring-extras` after the operator is up.
 	sed -i.bak 's|--diagnostics-address=127.0.0.1:8080|--diagnostics-address=:8080|g' $(INSTALL_YAML)
+	# Bump operator resource limits — defaults (500m cpu / 128Mi mem) OOMKill
+	# at 100+ HCPs and the webhook svc loses endpoints during the restart,
+	# breaking subsequent scenarios. The values here match what we've found
+	# headroom-comfortable across the article matrix.
+	sed -i.bak 's|cpu: 500m|cpu: "4"|; s|memory: 128Mi|memory: 4Gi|' $(INSTALL_YAML)
+	sed -i.bak 's|cpu: 10m|cpu: 500m|; s|memory: 64Mi|memory: 512Mi|' $(INSTALL_YAML)
 	rm -f $(INSTALL_YAML).bak
 	@echo "Manifest: $(INSTALL_YAML)"
 
