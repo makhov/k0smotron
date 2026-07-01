@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -53,6 +55,12 @@ const (
 	controlPlaneEnableArg   = "--enable-controller=control-plane"
 	controlPlaneMetricLabel = `controller="k0smotroncontrolplane"`
 	reconcileMetricName     = "controller_runtime_reconcile_total"
+
+	// Namespace-scoping regression test: two clusters share the same name in
+	// different namespaces; each control plane must report only its own replicas.
+	scopedNamespaceFoo           = "watch-selector-ns-foo"
+	scopedNamespaceBar           = "watch-selector-ns-bar"
+	expectedControlPlaneReplicas = 1
 )
 
 type CAPIMultiInstanceWatchSelectorSuite struct {
@@ -141,6 +149,145 @@ func (s *CAPIMultiInstanceWatchSelectorSuite) TestWatchFilterIsolatesMultipleCAP
 		return false, nil
 	})
 	s.ErrorContains(err, "context deadline exceeded", "the secondary controller should stay idle for primary-labeled resources once scoped")
+}
+
+// TestReportedReplicasAreNamespaceScoped verifies that control-plane replica
+// reporting is scoped to the owning cluster's namespace. Two clusters share the
+// same name in different namespaces and are reconciled by the same all-namespace
+// controller. Each control plane must report only its own replicas and never the
+// cross-namespace sum (regression test for namespace-unscoped pod counting).
+func (s *CAPIMultiInstanceWatchSelectorSuite) TestReportedReplicasAreNamespaceScoped() {
+	ctx := s.ctx
+
+	s.Require().NoError(s.ensureNamespace(ctx, scopedNamespaceFoo))
+	s.Require().NoError(s.ensureNamespace(ctx, scopedNamespaceBar))
+	defer s.cleanupNamespaceScopedResources()
+
+	namespaces := []string{scopedNamespaceFoo, scopedNamespaceBar}
+
+	s.T().Log("creating two clusters that share the same name in different namespaces")
+	for _, namespace := range namespaces {
+		s.applyManifest(clusterYAMLInNamespace(namespace))
+	}
+
+	// Wait until both control planes have created their pods, so the pods that
+	// the buggy (namespace-unscoped) counter would leak across namespaces are
+	// present before we assert.
+	for _, namespace := range namespaces {
+		s.T().Logf("waiting for the control plane in %q to report its replicas", namespace)
+		err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+			replicas, err := s.getReportedControlPlaneReplicas(ctx, namespace)
+			if err != nil {
+				return false, nil
+			}
+			return replicas >= expectedControlPlaneReplicas, nil
+		})
+		s.Require().NoError(err, "control plane in %q never reported its replicas", namespace)
+	}
+
+	// With both clusters' pods present, each control plane must report only its
+	// own replicas, never the cross-namespace sum.
+	for _, namespace := range namespaces {
+		replicas, err := s.getReportedControlPlaneReplicas(ctx, namespace)
+		s.Require().NoError(err)
+		s.Require().Equal(expectedControlPlaneReplicas, replicas, "control plane in %q must report only its own replicas, not the cross-namespace sum", namespace)
+	}
+}
+
+func (s *CAPIMultiInstanceWatchSelectorSuite) ensureNamespace(ctx context.Context, name string) error {
+	_, err := s.client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+	}, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+func (s *CAPIMultiInstanceWatchSelectorSuite) getReportedControlPlaneReplicas(ctx context.Context, namespace string) (int, error) {
+	out, err := exec.CommandContext(ctx, "kubectl", "get", "k0smotroncontrolplane", testControlPlaneName,
+		"-n", namespace, "-o", "jsonpath={.status.replicas}").CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("get K0smotronControlPlane replicas: %s", string(out))
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		// Status not populated yet.
+		return 0, nil
+	}
+	return strconv.Atoi(value)
+}
+
+func (s *CAPIMultiInstanceWatchSelectorSuite) applyManifest(manifest string) {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	out, err := cmd.CombinedOutput()
+	s.Require().NoError(err, "failed to apply manifest: %s", string(out))
+}
+
+func (s *CAPIMultiInstanceWatchSelectorSuite) cleanupNamespaceScopedResources() {
+	keep := os.Getenv("KEEP_AFTER_TEST")
+	if keep == "true" {
+		return
+	}
+	if keep == "on-failure" && s.T().Failed() {
+		return
+	}
+
+	for _, namespace := range []string{scopedNamespaceFoo, scopedNamespaceBar} {
+		cmd := exec.Command("kubectl", "delete", "--ignore-not-found", "-f", "-")
+		cmd.Stdin = strings.NewReader(clusterYAMLInNamespace(namespace))
+		_, _ = cmd.CombinedOutput()
+	}
+	_ = s.client.CoreV1().Namespaces().Delete(context.Background(), scopedNamespaceFoo, metav1.DeleteOptions{})
+	_ = s.client.CoreV1().Namespaces().Delete(context.Background(), scopedNamespaceBar, metav1.DeleteOptions{})
+}
+
+func clusterYAMLInNamespace(namespace string) string {
+	return fmt.Sprintf(`apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      - 192.168.0.0/16
+    serviceDomain: cluster.local
+    services:
+      cidrBlocks:
+      - 10.128.0.0/12
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: K0smotronControlPlane
+    name: %[3]s
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: DevCluster
+    name: %[4]s
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DevCluster
+metadata:
+  name: %[4]s
+  namespace: %[2]s
+spec:
+  backend:
+    docker: {}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: K0smotronControlPlane
+metadata:
+  name: %[3]s
+  namespace: %[2]s
+spec:
+  version: v1.32.6+k0s.0
+  persistence:
+    type: emptyDir
+  service:
+    type: NodePort
+`, testClusterName, namespace, testControlPlaneName, testInfrastructureName)
 }
 
 func (s *CAPIMultiInstanceWatchSelectorSuite) findControlPlaneDeploymentName(ctx context.Context) (string, error) {
