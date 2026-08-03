@@ -79,7 +79,7 @@ spec:
   storage:
     type: etcd
     etcd:
-      image: quay.io/k0sproject/etcd:v3.5.13
+      image: quay.io/k0sproject/etcd:v3.7.1
       resources:
         requests:
           cpu: 100m

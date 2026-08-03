@@ -234,7 +234,7 @@ spec:
     type: etcd
     etcd:
       autoDeletePVCs: false
-      image: quay.io/k0sproject/etcd:v3.5.13
+      image: quay.io/k0sproject/etcd:v3.7.1
       persistence:
         size: 1Gi
   image: ghcr.io/k0sproject/k0s:v1.32.6-k0s.0  # pinned GHCR tag to avoid rate limits with docker hub
